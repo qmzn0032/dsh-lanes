@@ -66,8 +66,36 @@ from pathlib import Path
 
 # ======================= 常量与默认配置 =======================
 
-SCRIPT_DIR = Path(__file__).resolve().parent
+# 冻结成 exe（PyInstaller）之后 `__file__` 指向**临时解包目录**（_MEIPASS）：
+# 配置必须跟着 exe 走，跟着临时目录走的话一退出就没了。
+FROZEN = bool(getattr(sys, "frozen", False))
+
+
+def app_dir() -> Path:
+    """本程序自己的目录：源码运行＝脚本目录；冻结后＝exe 所在目录。
+
+    冻结后优先把 `lanes.json` 放在 exe 旁边（便携、拷走就能用）；
+    那个目录不可写时（例如被塞进 Program Files）退到 `%APPDATA%\\dsh-lanes`，
+    避免"第一次保存配置就崩"。
+    """
+    if not FROZEN:
+        return Path(__file__).resolve().parent
+    base = Path(sys.executable).resolve().parent
+    try:
+        probe = base / ".dsh-lanes-write-test"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        return base
+    except OSError:
+        appdata = os.environ.get("APPDATA")
+        return Path(appdata) / "dsh-lanes" if appdata else base
+
+
+SCRIPT_DIR = app_dir()
 CONFIG_PATH = SCRIPT_DIR / "lanes.json"
+
+# 提示文字里"下一步该敲什么"用的程序名：源码是 .py，冻结后是 .exe 自己的名字
+ME_NAME = Path(sys.executable).name if FROZEN else Path(__file__).name
 PKG = "@deepseek-ai/dsh"
 PKG_URL_NAME = "@deepseek-ai%2Fdsh"
 
@@ -184,11 +212,15 @@ def load_config() -> dict:
     if not cfg.get("root"):
         cfg["root"] = default_root()
     if not cfg.get("default_cwd"):
-        # 脚本位于 <工作区>\\启动器\\ 下，默认工作区取上两级
-        try:
-            cfg["default_cwd"] = str(Path(__file__).resolve().parents[2])
-        except IndexError:
+        if FROZEN:
+            # 冻结后 __file__ 在临时解包目录里，"上两级"没有任何意义 → 用用户主目录
             cfg["default_cwd"] = str(Path.home())
+        else:
+            # 脚本位于 <工作区>\启动器\ 下，默认工作区取上两级
+            try:
+                cfg["default_cwd"] = str(Path(__file__).resolve().parents[2])
+            except IndexError:
+                cfg["default_cwd"] = str(Path.home())
     merged = dict(DEFAULT_ALLOW_SCRIPTS)
     merged.update(cfg.get("allow_scripts") or {})
     cfg["allow_scripts"] = merged
@@ -1219,7 +1251,7 @@ def require_version_installed(cfg: dict, lane: str) -> tuple[str, Path, Path]:
             )
         raise RuntimeError(
             f"lane「{lane}」的版本 {version} 尚未安装。先执行：\n"
-            f"    py {Path(__file__).name} create {lane} {version}"
+            f"    py {ME_NAME} create {lane} {version}"
         )
     if not lane_data.get("installDir") and installed_version(vdir) != version:
         raise RuntimeError(
@@ -1347,9 +1379,9 @@ def cmd_create(cfg: dict, args) -> int:
     if not primary_lane(cfg):
         info("")
         warn("还没有设置主要版本。设一个之后，以后新建的版本会自动继承它的 API key：")
-        info(col(f"      py {Path(__file__).name} primary {lane}", C.CYAN))
+        info(col(f"      py {ME_NAME} primary {lane}", C.CYAN))
     info("")
-    info(col(f"  下一步： py {Path(__file__).name} open {lane}", C.CYAN))
+    info(col(f"  下一步： py {ME_NAME} open {lane}", C.CYAN))
     return 0
 
 
@@ -1530,7 +1562,7 @@ def cmd_open(cfg: dict, args) -> int:
 
         if args.detach:
             info(col("  已转入后台（--detach）。停止： "
-                    f"py {Path(__file__).name} stop {lane}", C.GRAY))
+                    f"py {ME_NAME} stop {lane}", C.GRAY))
             stop.set()
             thread.join(timeout=2)
             return 0
@@ -1657,7 +1689,7 @@ def cmd_adopt(cfg: dict, args) -> int:
     info("")
     info(
         col(
-            f"  下一步： py {Path(__file__).name} open {lane}"
+            f"  下一步： py {ME_NAME} open {lane}"
             "   （若该端口已有实例在跑，会自动接管它而不会再起一个）",
             C.CYAN,
         )
@@ -2355,7 +2387,7 @@ def cmd_clone(cfg: dict, args) -> int:
         warn(f"有 {len(rel['errors'])} 个农场链接没建起来（副本仍能跑，但依赖解析结构和原件不一致）")
         for path_text, reason in rel["errors"][:4]:
             info(col(f"      {path_text}：{reason}", C.GRAY))
-        info(col(f"      核对： py {Path(__file__).name} verify {new}", C.CYAN))
+        info(col(f"      核对： py {ME_NAME} verify {new}", C.CYAN))
     refs = read_credential_refs(plan["home"])
     info(f"      API key   : {'、'.join(sorted(refs)) if refs else '无（源 HOME 里就没有）'}")
 
@@ -2367,14 +2399,14 @@ def cmd_clone(cfg: dict, args) -> int:
         if len(errors) > 6:
             info(col(f"      …还有 {len(errors) - 6} 条", C.GRAY))
         warn("如果源 lane 正在运行，先 `stop` 它再删掉这个副本重来：")
-        info(col(f"      py {Path(__file__).name} delete {new} --stop", C.CYAN))
+        info(col(f"      py {ME_NAME} delete {new} --stop", C.CYAN))
         return 1
 
     info("")
-    info(col(f"  下一步①： py {Path(__file__).name} open {new} --no-browser", C.CYAN))
+    info(col(f"  下一步①： py {ME_NAME} open {new} --no-browser", C.CYAN))
     info(col("          （副本有自己的安装树和 HOME，可以和原件同时开着）", C.GRAY))
-    info(col(f"  下一步②： py {Path(__file__).name} verify {new}   # 核对隔离真的成立", C.CYAN))
-    info(col(f"  下一步③： py {Path(__file__).name} upgrade {new} <版本>   # 升级这个副本，原件一点不动", C.CYAN))
+    info(col(f"  下一步②： py {ME_NAME} verify {new}   # 核对隔离真的成立", C.CYAN))
+    info(col(f"  下一步③： py {ME_NAME} upgrade {new} <版本>   # 升级这个副本，原件一点不动", C.CYAN))
     return 0
 
 
@@ -2483,7 +2515,7 @@ def upgrade_checks(cfg: dict, lane: str, version: str, tree: Path,
 
 
 def cmd_upgrade(cfg: dict, args) -> int:
-    me = Path(__file__).name
+    me = ME_NAME
     lane = args.lane
     if lane not in cfg.get("lanes", {}):
         fail(f"没有 lane「{lane}」（现有：{'、'.join(cfg.get('lanes', {})) or '无'}）")
@@ -3879,7 +3911,7 @@ def cmd_plugins_write_disabled(cfg: dict, args) -> int:
     所以**写开关一律停用**，只保留只读清单；真要开关插件，用 DSH 自己的插件市场页面。
     """
     lane = getattr(args, "lane", "") or "<lane>"
-    me = Path(__file__).name
+    me = ME_NAME
     warn("「用启动器写补丁层来开关插件」已经停用（2026-09-27）。")
     info(col("  原因：2026-09-27 11:00 那次开关把 profile 的补丁层写坏了，DSH 直接拒绝启动该 profile：", C.GRAY))
     info(col("        YAMLException: duplicated mapping key (13:3)", C.GRAY))
@@ -3902,7 +3934,7 @@ def cmd_plugins(cfg: dict, args) -> int:
         fail(f"没有 lane「{lane}」")
         return 1
     listing = plugin_listing(cfg, lane)
-    me = Path(__file__).name
+    me = ME_NAME
     info(col(f"── lane「{lane}」的插件开关（profile {listing['profile']}）──　"
              "（只读；写开关已停用，见 README）", C.BOLD))
     info(f"  DSH_HOME : {listing['home']}")
@@ -4009,7 +4041,7 @@ def cmd_plugin_switch(cfg: dict, args, want_on: bool) -> int:
         fail(why)
         return 1
     name = item["pkg"]
-    me = Path(__file__).name
+    me = ME_NAME
     if item["official"]:
         fail(f"{name} 是官方组合包，不归这个开关管（关它等于把 DSH 自己的部件摘掉）")
         return 1
@@ -4274,13 +4306,13 @@ def cmd_plugins_off(cfg: dict, args) -> int:
                 fail(f"自动还原失败，请手动把备份复制回去：{backup} → {patch_file}（{exc}）")
             warn("通常是因为某个组合包**提供的服务**被一起关掉了"
                  "（本机就是 @liustack/modsearch 插入的 `web` 行）。排除它再试：")
-            info(col(f"      py {Path(__file__).name} plugins-off {lane} --keep @liustack/modsearch", C.CYAN))
+            info(col(f"      py {ME_NAME} plugins-off {lane} --keep @liustack/modsearch", C.CYAN))
     info("")
-    info(col(f"  撤销： py {Path(__file__).name} plugins-on {lane}", C.CYAN))
+    info(col(f"  撤销： py {ME_NAME} plugins-on {lane}", C.CYAN))
     if lane_runtime(cfg, lane):
         info(col("  生效： 已经热生效了（这条 lane 正在运行，补丁层是热重载盯着的文件）", C.CYAN))
     else:
-        info(col(f"  生效： py {Path(__file__).name} open {lane}（下次启动时应用）", C.CYAN))
+        info(col(f"  生效： py {ME_NAME} open {lane}（下次启动时应用）", C.CYAN))
     return 1 if problems else 0
 
 
@@ -4546,7 +4578,7 @@ def cmd_market(cfg: dict, args) -> int:
         fail(f"没有 lane「{lane}」")
         return 1
     st = market_status(cfg, lane, with_registry=not getattr(args, "offline", False))
-    me = Path(__file__).name
+    me = ME_NAME
     info(col(f"── 插件市场（{MARKET_PKG}）：lane「{lane}」──", C.BOLD))
     installed = st["installed"]
     info(f"  装在哪    {st['package_dir']}")
@@ -4600,7 +4632,7 @@ def cmd_market_off(cfg: dict, args) -> int:
     if lane not in cfg.get("lanes", {}):
         fail(f"没有 lane「{lane}」")
         return 1
-    me = Path(__file__).name
+    me = ME_NAME
     st = market_status(cfg, lane)
     if not st["spec"] and not st["package_dir"].is_dir():
         fail(f"lane「{lane}」的 profile 里没有插件市场（{MARKET_PKG}）")
@@ -5150,7 +5182,7 @@ def cmd_market_rollback(cfg: dict, args) -> int:
         ok(f"已退回 {now}")
     else:
         warn(f"退回后读到的是 {now or '（读不到）'}，和快照里的 {target['version'] or '?'} 不一致，请人工看一眼")
-    info(col(f"  重启这条 lane 才会生效： py {Path(__file__).name} stop {lane} && py {Path(__file__).name} open {lane}", C.CYAN))
+    info(col(f"  重启这条 lane 才会生效： py {ME_NAME} stop {lane} && py {ME_NAME} open {lane}", C.CYAN))
     return 0
 
 
@@ -5172,7 +5204,7 @@ def cmd_market_update(cfg: dict, args) -> int:
     if lane not in cfg.get("lanes", {}):
         fail(f"没有 lane「{lane}」")
         return 1
-    me = Path(__file__).name
+    me = ME_NAME
     info(col(f"── 更新插件市场：lane「{lane}」──", C.BOLD))
     if lane_runtime(cfg, lane) and not getattr(args, "force", False):
         fail(f"lane「{lane}」正在运行：更新会改它 profile 里的 node_modules，"
@@ -5429,7 +5461,7 @@ def cmd_chat_backup(cfg: dict, args) -> int:
     if snap["errors"]:
         fail(f"复制时有 {len(snap['errors'])} 个错误，这份备份**不可信**：{snap['errors'][:3]}")
         return 1
-    me = Path(__file__).name
+    me = ME_NAME
     info("")
     info(col(f"  看备份： py {me} chat-list {lane}", C.CYAN))
     info(col(f"  恢复  ： py {me} chat-restore {lane} {snap['name']}", C.CYAN))
@@ -5442,7 +5474,7 @@ def cmd_chat_list(cfg: dict, args) -> int:
         fail(f"没有 lane「{lane}」")
         return 1
     snaps = chat_snapshots(cfg, lane)
-    me = Path(__file__).name
+    me = ME_NAME
     info(col(f"── lane「{lane}」的对话备份 ──", C.BOLD))
     info(f"  目录      {chat_lane_root(cfg, lane)}")
     info(f"  会话目录  {lane_home(cfg, lane) / 'sessions'}"
@@ -5566,7 +5598,7 @@ def cmd_chat_restore(cfg: dict, args) -> int:
             fail(f"恢复后有 {len(diff)} 个文件对不上：{diff[:3]}")
             return 1
         ok(f"逐文件校验通过：{len(expected)} 个文件与快照完全一致")
-    me = Path(__file__).name
+    me = ME_NAME
     if pre:
         info(col(f"  反悔用  ： py {me} chat-restore {lane} {pre['name']} --yes", C.CYAN))
     info(col(f"  重启    ： py {me} open {lane}", C.CYAN))
@@ -5780,7 +5812,7 @@ def cmd_delete(cfg: dict, args) -> int:
     if was_primary:
         warn("主要版本标记已一并清空。")
     if left and not primary_lane(cfg):
-        info(col(f"  建议重新指定主要版本： py {Path(__file__).name} primary {left[0][0]}", C.CYAN))
+        info(col(f"  建议重新指定主要版本： py {ME_NAME} primary {left[0][0]}", C.CYAN))
     return 0
 
 

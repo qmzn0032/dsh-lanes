@@ -67,6 +67,16 @@ py dsh_lanes.py stop next
 `start.bat open next` 是同一个入口（双击也能用，会 pause 住输出）。
 完整命令见第 6 节，或 `py dsh_lanes.py --help`。
 
+**不想装 Python？用打好的单文件 exe**（自己打见第 10 节）：
+
+| exe | 用途 |
+| --- | --- |
+| `dsh-lanes-gui.exe` | 双击即用，和 `start_gui.bat` 一样 |
+| `dsh-lanes.exe` | 命令行版，参数与 `py dsh_lanes.py` 完全一致（例如 `dsh-lanes.exe doctor`） |
+
+exe **自带 Python 运行时**，目标机器不用装 Python；但**仍然需要 Node.js + npm**（dsh 本体是 npm 包）。
+exe 没签名，首次运行 Windows SmartScreen 可能拦一下：点「更多信息 → 仍要运行」。
+
 ---
 
 ## 4. 隔离是怎么做到的
@@ -91,7 +101,8 @@ py dsh_lanes.py stop next
 
 启动器不注入 dsh 进程，但**确实会写下面这些地方**，都是你点什么才写什么：
 
-- 自己的 `lanes.json`（登记表、主要版本、窗口几何）
+- 自己的 `lanes.json`（登记表、主要版本、窗口几何）——**源码运行**时在脚本目录，
+  **exe 运行**时在 exe 所在目录（便携，拷走就能用）；那个目录不可写时自动退到 `%APPDATA%\dsh-lanes`
 - lane 的安装树（创建 / 升级 / 复制 / 删除）
 - lane 的 `DSH_HOME`（复制过来的 API key、对话恢复、运行态文件 `<root>\run\<lane>.json`、备份目录 `<root>\backups\`）
 - 「插件市场」单独开关（`market-off` / `market-on`）会往对应 profile 的补丁层里写一段**带起止标记**的块，用 `market-on` 可整段撤销——其它插件一个都不碰
@@ -167,9 +178,42 @@ py selftest.py [lane ...]                 全链路复检：open → 认证握�
 | 端口被别的东西占了 | `py dsh_lanes.py instances` |
 | 副本一装插件就崩 | `py dsh_lanes.py verify <lane>`；再 `verify <lane> --fix` |
 | 怀疑 profile 补丁层坏了 | `verify` 会顺手体检：调宿主自带那份 js-yaml 真解析一遍，报错原话带 `行:列` |
+| 用 exe 起不来又没报错 | `--windowed` 的 GUI exe 没有控制台：改用 `dsh-lanes.exe doctor`（同目录）看报错 |
 
 ---
 
-## 10. 许可
+## 10. 自己打包成 exe
+
+```bat
+py -m pip install pyinstaller      :: 只需一次
+build_exe.bat                      :: 双击也行
+```
+
+产物（`dist\`）：
+
+| 文件 | 打包参数 | 实测大小 |
+| --- | --- | --- |
+| `dsh-lanes.exe` | `--onefile --console` | ≈ 7.7 MB |
+| `dsh-lanes-gui.exe` | `--onefile --windowed` | ≈ 10.8 MB |
+
+两个都要，别只用 GUI：出问题时 `dsh-lanes.exe doctor` 是唯一能看到报错的入口
+（`--windowed` 的 exe 没有控制台，早期崩溃是静默的）。
+
+**冻结后有两个行为会变**（源码里 `FROZEN` 分支，就这两处）：
+
+- **配置位置**：`lanes.json` 跟着 **exe 所在目录**走。因为冻结后 `__file__` 指向临时解包目录
+  （`_MEIPASS`），照原样写配置会"退出就丢"。该目录不可写（例如塞进 `Program Files`）时退回 `%APPDATA%\dsh-lanes`。
+- **默认工作区**：源码运行时取"脚本上两级目录"（也就是你放 dsh 项目的那个文件夹），
+  冻结后那个位置没有意义，改用用户主目录。
+
+**想更小/更快**：把 `--onefile` 换成 `--onedir`——启动快很多、被杀软误报也少，代价是分享时得发整个文件夹。
+**想要图标**：加 `--icon your.ico`（仓库里没带图标）。
+
+仓库的 `.gitignore` 已经排除 `build/`、`dist/`、`*.spec`：**exe 不要提交进仓库**，
+要分享就发到 GitHub 的 **Releases**（附件，单文件、几十 MB 上限完全够用）。
+
+---
+
+## 11. 许可
 
 MIT，见 [LICENSE](LICENSE)。
