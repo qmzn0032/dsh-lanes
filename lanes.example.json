@@ -1,0 +1,22 @@
+{
+  "root": "D:\\dsh-lanes",
+  "node": "",
+  "npm_cli": "",
+  "registry": "",
+  "port_range": [
+    3080,
+    3129
+  ],
+  "default_cwd": "",
+  "startup_timeout": 240,
+  "open_browser": true,
+  "primary": "",
+  "allow_scripts": {
+    "@deepseek-ai/dsh-subprocess-local": true,
+    "koffi": true,
+    "node-pty": true,
+    "@google/genai": true,
+    "protobufjs": true
+  },
+  "lanes": {}
+}
