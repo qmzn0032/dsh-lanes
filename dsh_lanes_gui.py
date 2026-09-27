@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import traceback
 import webbrowser
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
@@ -334,7 +335,14 @@ class LauncherApp:
         self._snap_at = 0.0
         self._remote_busy = False           # 顶部「npm 上：…」那行：是否查询中 / 上次查询时间
         self._remote_at = 0.0
-        self.refresh_lanes(force=True)
+        try:
+            self.refresh_lanes(force=True)
+        except Exception as exc:  # noqa: BLE001
+            # 首次刷新失败也要把窗口开出来（能看日志、能手动重试），
+            # 而不是留一个半成品窗口或者干脆消失。
+            self.log(f"[XX] 首次刷新失败：{type(exc).__name__}: {exc}", "warn")
+            self.log("     窗口仍然可用：修掉原因后按 F5 / 点「刷新」重试。", "muted")
+            self.log(traceback.format_exc().rstrip(), "muted")
         self.root.after(120, self._poll_queue)
         self.root.after(200, lambda: self.refresh_remote(force=True))  # 不挡开窗，查完再贴上去
         self.root.after(2000, self._tick)
@@ -345,6 +353,17 @@ class LauncherApp:
         self.log("欢迎使用 DSH 多版本启动器。左边是各版本 lane，右边是实时日志。", "head")
         self.log("快捷键：F5 刷新　Ctrl+L 清空日志　Ctrl+N 新建版本　双击卡片＝打开　点地址＝复制", "muted")
         self.log("标题下面那行的「√」＝本机已经装了这个版本；点「官方代码库 ↗」直接去 dsh 的仓库。", "muted")
+
+        # 根目录不可写时说清楚（不是不能用，而是"记不住 + 部分命令会失败"），
+        # 别让它以"某个操作突然报错"的形式冒出来。
+        root_ok, root_detail = core.lane_root_writable(self.cfg)
+        if not root_ok:
+            self.log(f"[!!] lane 根目录不可写：{root_detail}", "warn")
+            self.log(
+                "     卡片和打开/停止仍可用（状态现场探测）；但运行态记不住，"
+                "克隆 / 删除 / 升级这些要写目录的命令会失败。",
+                "warn",
+            )
 
     # ── 基础 ────────────────────────────────────────────────────────────────
     def _center(self, w: int, h: int) -> None:
@@ -2308,7 +2327,27 @@ def main() -> int:
         root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72.0)
     except Exception:
         pass
-    app = LauncherApp(root)
+    try:
+        app = LauncherApp(root)
+    except Exception as exc:  # noqa: BLE001
+        # 绝不留一个"没有 mainloop 的半成品窗口"：那种窗口既不能正常用、也关不掉
+        # （2026-09-27 的故障就是这样：__init__ 里写运行态被拒 → 弹错误框 → 窗口挂着不动）。
+        detail = traceback.format_exc()
+        try:
+            messagebox.showerror(
+                "DSH 多版本启动器 · 启动失败",
+                f"{type(exc).__name__}: {exc}\n\n"
+                f"{detail[-1200:]}\n"
+                "窗口已关闭；完整信息也写到了 stderr（命令行里跑能看到）。",
+            )
+        except Exception:
+            pass
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        print(detail, file=sys.stderr, flush=True)
+        return 1
 
     if args.selfcheck:
         root.withdraw()

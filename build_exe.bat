@@ -25,6 +25,18 @@ cd /d "%~dp0"
 where py >nul 2>nul
 if %errorlevel%==0 (set PY=py) else (set PY=python)
 
+rem A running exe locks its own folder (dist\...\_internal\*.dll), and the build
+rem then dies halfway with "PermissionError: ... libcrypto-3.dll". Fail early instead.
+for %%E in (dsh-lanes.exe dsh-lanes-gui.exe) do (
+    tasklist /fi "imagename eq %%E" 2>nul | find /i "%%E" >nul
+    if not errorlevel 1 (
+        echo [XX] %%E is still running - close that window first, then run this again.
+        echo      ^(or force it:  taskkill /f /im %%E)
+        pause
+        exit /b 1
+    )
+)
+
 %PY% -m PyInstaller --version >nul 2>nul
 if not %errorlevel%==0 (
     echo [XX] PyInstaller not found. Install it first:

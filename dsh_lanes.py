@@ -632,16 +632,54 @@ def read_run(cfg: dict, lane: str) -> dict | None:
         return None
 
 
-def write_run(cfg: dict, lane: str, data: dict) -> None:
-    p = ensure_layout(cfg)
-    (p["run"] / f"{lane}.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+_WRITE_WARNED: set[str] = set()
+
+
+def lane_root_writable(cfg: dict) -> tuple[bool, str]:
+    """lane 根目录能不能写。返回 (能不能写, 说明文字)。
+
+    运行态、克隆、删除、升级都要写这个目录；不能写时不代表不能用——
+    只是"窗口下次打开不会记得这条 lane"，所以只提示，不拦。
+    """
+    root = Path(cfg.get("root") or "")
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / ".write-test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True, str(root)
+    except OSError as exc:
+        return False, f"{root}（{exc}）"
+
+
+def write_run(cfg: dict, lane: str, data: dict) -> bool:
+    """写运行态文件。**绝不抛异常**：写不进去只警告一次，功能降级。
+
+    为什么这么写：这个文件只是"记住上一次是谁起的"，不是必要数据；而它在 GUI 每次刷新的
+    链路上（lane_states → reconcile_lane）。一旦它抛异常，整个窗口会在 __init__ 里死掉——
+    2026-09-27 就是这么崩的：受限环境里 `D:\\dsh-lanes\\run\\npx.json` 不许写，
+    结果窗口起不来、也关不掉（没有 mainloop 的半成品窗口）。
+    """
+    try:
+        p = ensure_layout(cfg)
+        (p["run"] / f"{lane}.json").write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return True
+    except OSError as exc:
+        key = f"{lane}|{exc}"
+        if key not in _WRITE_WARNED:
+            _WRITE_WARNED.add(key)
+            warn(f"运行态写不进去（{paths(cfg)['run']}）：{exc}")
+            warn("  这条 lane 照样能用：状态每次现场探测，只是下次打开窗口时不会自动认回来。")
+        return False
 
 
 def clear_run(cfg: dict, lane: str) -> None:
     f = paths(cfg)["run"] / f"{lane}.json"
     try:
         f.unlink()
-    except FileNotFoundError:
+    except OSError:
         pass
 
 
@@ -6067,6 +6105,13 @@ def main() -> int:
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
+        # 双击 exe（不带参数）时控制台会立刻关掉，看起来像"打不开"；这里等一下回车。
+        # 只有真人在终端里跑（stdin 是终端）才停；管道/脚本里不拦。
+        if getattr(sys.stdin, "isatty", lambda: False)():
+            try:
+                input("\n按回车键关闭这个窗口…")
+            except (EOFError, KeyboardInterrupt):
+                pass
         return 0
 
     cfg = load_config()
