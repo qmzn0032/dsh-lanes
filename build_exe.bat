@@ -1,19 +1,23 @@
 @echo off
 rem ============================================================
-rem  DSH multi-version launcher - build standalone .exe files
+rem  DSH multi-version launcher - build standalone exe folders
 rem  Pure ASCII + CRLF on purpose: avoids cmd.exe encoding issues.
 rem
 rem  Output (in dist\):
-rem    dsh-lanes.exe        CLI   (console window)
-rem    dsh-lanes-gui.exe    GUI   (windowed, double-click to run)
+rem    dist\dsh-lanes\dsh-lanes.exe            CLI   (console)
+rem    dist\dsh-lanes-gui\dsh-lanes-gui.exe    GUI   (windowed)
 rem
-rem  Needs PyInstaller (once):
-rem    py -m pip install pyinstaller
+rem  IMPORTANT - this builds --onedir, NOT --onefile:
+rem  --onefile unpacks itself into %TEMP% on every start. On this machine
+rem  that gets blocked ("[PYI-xxxx:ERROR] Could not create temporary
+rem  directory!", or "Failed to extract VCRUNTIME140.dll"), and the
+rem  --windowed GUI only shows a dialog titled "Error". --onedir needs no
+rem  unpacking and starts fine, so it is the default here.
 rem
-rem  Note: lanes.json is kept NEXT TO the .exe (portable - copy the
-rem  exe anywhere and it carries its own config). If that folder is
-rem  not writable (e.g. Program Files), it falls back to
-rem  %APPDATA%\dsh-lanes automatically.
+rem  When sharing: zip the WHOLE folder, do not copy the .exe alone -
+rem  the .exe needs the DLLs and the _internal folder next to it.
+rem
+rem  Needs PyInstaller (once):  py -m pip install pyinstaller
 rem ============================================================
 setlocal
 cd /d "%~dp0"
@@ -29,20 +33,21 @@ if not %errorlevel%==0 (
     exit /b 1
 )
 
-echo === [1/2] building CLI exe: dist\dsh-lanes.exe ===
-%PY% -m PyInstaller --noconfirm --clean --onefile --console --name dsh-lanes dsh_lanes.py
+echo === [1/2] building CLI: dist\dsh-lanes\dsh-lanes.exe ===
+%PY% -m PyInstaller --noconfirm --clean --onedir --console --name dsh-lanes dsh_lanes.py
 if not %errorlevel%==0 goto fail
 
-echo === [2/2] building GUI exe: dist\dsh-lanes-gui.exe ===
-%PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name dsh-lanes-gui dsh_lanes_gui.py
+echo === [2/2] building GUI: dist\dsh-lanes-gui\dsh-lanes-gui.exe ===
+%PY% -m PyInstaller --noconfirm --clean --onedir --windowed --name dsh-lanes-gui dsh_lanes_gui.py
 if not %errorlevel%==0 goto fail
 
 echo.
-echo [OK] build finished. Files in dist\:
-dir /b "dist\*.exe"
+echo [OK] build finished. Run these:
+echo      dist\dsh-lanes\dsh-lanes.exe doctor
+echo      dist\dsh-lanes-gui\dsh-lanes-gui.exe
 echo.
-echo Reminder: unsigned exe - Windows SmartScreen may ask for
-echo confirmation on first run ("More info" -^> "Run anyway").
+echo Reminder: unsigned exe - SmartScreen may ask for confirmation
+echo on first run ("More info" -^> "Run anyway").
 pause
 exit /b 0
 

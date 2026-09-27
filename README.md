@@ -67,15 +67,16 @@ py dsh_lanes.py stop next
 `start.bat open next` 是同一个入口（双击也能用，会 pause 住输出）。
 完整命令见第 6 节，或 `py dsh_lanes.py --help`。
 
-**不想装 Python？用打好的单文件 exe**（自己打见第 10 节）：
+**不想装 Python？用打好的 exe**（自己打见第 10 节）：
 
-| exe | 用途 |
+| 目录里的 exe | 用途 |
 | --- | --- |
-| `dsh-lanes-gui.exe` | 双击即用，和 `start_gui.bat` 一样 |
-| `dsh-lanes.exe` | 命令行版，参数与 `py dsh_lanes.py` 完全一致（例如 `dsh-lanes.exe doctor`） |
+| `dsh-lanes-gui\dsh-lanes-gui.exe` | 双击即用，和 `start_gui.bat` 一样 |
+| `dsh-lanes\dsh-lanes.exe` | 命令行版，参数与 `py dsh_lanes.py` 完全一致（例如 `dsh-lanes.exe doctor`） |
 
 exe **自带 Python 运行时**，目标机器不用装 Python；但**仍然需要 Node.js + npm**（dsh 本体是 npm 包）。
 exe 没签名，首次运行 Windows SmartScreen 可能拦一下：点「更多信息 → 仍要运行」。
+**注意 exe 要连它所在文件夹一起用**（旁边有 DLL 与 `_internal`），单独拷 exe 出去跑不起来。
 
 ---
 
@@ -189,28 +190,40 @@ py -m pip install pyinstaller      :: 只需一次
 build_exe.bat                      :: 双击也行
 ```
 
-产物（`dist\`）：
+产物（`dist\`，**是文件夹不是单个文件**）：
 
-| 文件 | 打包参数 | 实测大小 |
+| 目录 | 打包参数 | 实测大小（zip 后） |
 | --- | --- | --- |
-| `dsh-lanes.exe` | `--onefile --console` | ≈ 7.7 MB |
-| `dsh-lanes-gui.exe` | `--onefile --windowed` | ≈ 10.8 MB |
+| `dist\dsh-lanes\` | `--onedir --console` | 7.8 MB |
+| `dist\dsh-lanes-gui\` | `--onedir --windowed` | 11.0 MB |
 
-两个都要，别只用 GUI：出问题时 `dsh-lanes.exe doctor` 是唯一能看到报错的入口
-（`--windowed` 的 exe 没有控制台，早期崩溃是静默的）。
+**为什么要两个**：`--windowed` 的 GUI exe 没有控制台，早期崩溃是**静默**的。
+出问题时 `dsh-lanes.exe doctor` 是唯一能看到报错的入口。
+
+**为什么默认 `--onedir` 而不是 `--onefile`**（实测踩过，不是偏好问题）：
+
+`--onefile` 每次启动都要把自己解包到 `%TEMP%`。在开发这台机器上这一步会被拦掉：
+
+```
+[PYI-28584:ERROR] Could not create temporary directory!
+（GUI 版没有控制台，只弹一个标题为 "Error" 的对话框 —— 双击看起来就是"什么都没发生/起不来"）
+```
+
+换成 `--onedir`（exe 旁边放 DLL 和 `_internal` 文件夹，**不需要解包**）后，CLI 与 GUI 都正常启动。
+所以要分享的话：**把整个文件夹打包成 zip 发出去，别只拷 exe**（exe 离开那些文件跑不起来）。
 
 **冻结后有两个行为会变**（源码里 `FROZEN` 分支，就这两处）：
 
-- **配置位置**：`lanes.json` 跟着 **exe 所在目录**走。因为冻结后 `__file__` 指向临时解包目录
-  （`_MEIPASS`），照原样写配置会"退出就丢"。该目录不可写（例如塞进 `Program Files`）时退回 `%APPDATA%\dsh-lanes`。
+- **配置位置**：`lanes.json` 跟着 **exe 所在目录**走。因为冻结后 `__file__` 指向 exe 自己的目录树，
+  而 `--onefile` 那种临时解包目录一退出就没了。该目录不可写（例如塞进 `Program Files`）时退回 `%APPDATA%\dsh-lanes`。
 - **默认工作区**：源码运行时取"脚本上两级目录"（也就是你放 dsh 项目的那个文件夹），
   冻结后那个位置没有意义，改用用户主目录。
 
-**想更小/更快**：把 `--onefile` 换成 `--onedir`——启动快很多、被杀软误报也少，代价是分享时得发整个文件夹。
 **想要图标**：加 `--icon your.ico`（仓库里没带图标）。
+**想试单文件**：把 `--onedir` 换回 `--onefile`，但先在你自己的机器上双击验证能不能起来。
 
 仓库的 `.gitignore` 已经排除 `build/`、`dist/`、`*.spec`：**exe 不要提交进仓库**，
-要分享就发到 GitHub 的 **Releases**（附件，单文件、几十 MB 上限完全够用）。
+要分享就发到 GitHub 的 **Releases**（附件，把 zip 挂上去）。
 
 ---
 
