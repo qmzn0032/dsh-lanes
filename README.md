@@ -218,8 +218,8 @@ build_exe.bat                      :: 双击也行
 
 | 目录 | 打包参数 | 实测大小（zip 后） |
 | --- | --- | --- |
-| `dist\dsh-lanes\` | `--onedir --console` | 7.8 MB |
-| `dist\dsh-lanes-gui\` | `--onedir --windowed` | 11.0 MB |
+| `dist\dsh-lanes\` | `--onedir --console` | 8.2 MB |
+| `dist\dsh-lanes-gui\` | `--onedir --windowed` | 11.5 MB |
 
 **为什么要两个**：`--windowed` 的 GUI exe 没有控制台，早期崩溃是**静默**的。
 出问题时 `dsh-lanes.exe doctor` 是唯一能看到报错的入口。
@@ -248,9 +248,20 @@ build_exe.bat                      :: 双击也行
 
 仓库的 `.gitignore` 已经排除 `build/`、`dist/`、`*.spec`：**exe 不要提交进仓库**，
 要分享就发到 GitHub 的 **Releases**（附件，把 zip 挂上去）。
+打包好的两个 zip 就放在 `dist\`：`dsh-lanes-onedir.zip`（CLI）、`dsh-lanes-gui-onedir.zip`（GUI）。
 
 ---
 
-## 11. 许可
+## 11. 更新记录
+
+见 [CHANGELOG.md](CHANGELOG.md)。当前版本 **v0.2.0**（2026-09-28）：
+
+- 新建 / 升级可以自己选下载源（官方源 / 镜像源），查版本与下载保证同源，缺包自动换源重试一次；
+- 打包改为 `--onedir`（`--onefile` 在本机起不来）；
+- 修掉"运行态写不进去 → 窗口变成关不掉的半成品"。
+
+---
+
+## 12. 许可
 
 MIT，见 [LICENSE](LICENSE)。
