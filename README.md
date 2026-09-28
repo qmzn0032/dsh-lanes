@@ -121,8 +121,8 @@ exe 没签名，首次运行 Windows SmartScreen 可能拦一下：点「更多�
 
 ```
 py dsh_lanes.py doctor                    环境自检
-py dsh_lanes.py versions [--all]          查 registry 版本与 dist-tag
-py dsh_lanes.py create <lane> <ver> [--port N] [--force]
+py dsh_lanes.py versions [--all] [--registry auto|official|mirror]
+py dsh_lanes.py create <lane> <ver> [--port N] [--force] [--registry auto|official|mirror]
 py dsh_lanes.py open <lane|ver> [--port N] [--cwd DIR] [--no-browser] [--detach] [--timeout N]
 py dsh_lanes.py list
 py dsh_lanes.py instances                 列出所有 DSH 实例（含不是本启动器启动的）
@@ -133,6 +133,7 @@ py dsh_lanes.py sync-key [lane ...]       把主要版本的 API key 补到已�
 py dsh_lanes.py delete <lane> [--stop] [--keep-home] [--keep-install] [--home-too] [--yes]
 py dsh_lanes.py clone <源 lane> <新 lane> [--port N]
 py dsh_lanes.py upgrade <lane> <版本|tag> [--stop] [--dry-run] [--no-boot-check]
+                                          [--registry auto|official|mirror]
 py dsh_lanes.py upgrade <lane> --rollback
 py dsh_lanes.py verify <lane> [--fix]
 py dsh_lanes.py plugins <lane> [--dump]   插件清单（只读）
@@ -155,7 +156,25 @@ py selftest.py [lane ...]                 全链路复检：open → 认证握�
 - 首次 `create`（或在窗口里新建版本）时**自动生成**，形状见 `lanes.example.json`。
 - 它记的是**你这台机器**的路径与登记表，属于本机配置——**不要提交、不要分享**（`.gitignore` 里已经排除）。
 - 关键字段：`root`（lane 根目录）、`port_range`、`default_cwd`（决定会话归属，DSH 按工作目录分项目）、
-  `primary`（主要版本，新建 lane 继承它的 API key）、`allow_scripts`（npm 11 起安装脚本要显式授权）、`lanes`（登记表）。
+  `primary`（主要版本，新建 lane 继承它的 API key）、`allow_scripts`（npm 11 起安装脚本要显式授权）、
+  `registry`（下载源，见下）、`lanes`（登记表）。
+
+### 下载源：`registry`（新建 / 升级时可逐次选择）
+
+`registry` 取值：留空或 `auto`（默认，先官方再镜像）、`official`（`registry.npmjs.org`）、
+`mirror`（`registry.npmmirror.com`），也可以直接写一个 http 地址（内网源；这种情况下不会自动换源）。
+
+两条规矩：
+
+1. **查版本和下载一定用同一个源。** 以前查版本走官方、下载走 npm 默认源（你 `.npmrc` 里的镜像），
+   两边不一致就出事：官方当天发的新版，镜像常常只同步了一半——`@deepseek-ai/dsh@0.2.0-rc.1`
+   镜像已经有了，可它的 12 个 `@deepseek-ai/dsh-*` 子包还没到（当时逐个核对了 259 个包），
+   于是 npm 在第一个缺的子包上报 `ETARGET` 装不上。现在用的是同一个源。
+2. **缺东西会自动换另一个源重试一次**（命令行加 `--registry`，GUI 在「新建版本 / 升级版本」
+   对话框里有「下载源」三选一，勾「记住」就写进 `lanes.json`）。换源是安全的：这类失败发生在
+   npm 写盘之前（日志停在 `reify:loadTrees`，安装树没被动过），实测过。日志里会写明换了哪个源。
+
+命令行临时改一次：`py dsh_lanes.py upgrade next 0.2.0-rc.1 --registry mirror`。
 
 ---
 
@@ -184,6 +203,7 @@ py selftest.py [lane ...]                 全链路复检：open → 认证握�
 | 副本一装插件就崩 | `py dsh_lanes.py verify <lane>`；再 `verify <lane> --fix` |
 | 怀疑 profile 补丁层坏了 | `verify` 会顺手体检：调宿主自带那份 js-yaml 真解析一遍，报错原话带 `行:列` |
 | 用 exe 起不来又没报错 | `--windowed` 的 GUI exe 没有控制台：改用 `dsh-lanes.exe doctor`（同目录）看报错 |
+| 新建 / 升级报 npm `ETARGET` / `notarget` | 那个源还没同步到这一版：加 `--registry official`（或 `mirror`）换一个源再试，或等几小时。工具默认就会自动换另一个源重试一次 |
 
 ---
 

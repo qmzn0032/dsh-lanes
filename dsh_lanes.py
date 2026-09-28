@@ -104,10 +104,34 @@ PKG_URL_NAME = "@deepseek-ai%2Fdsh"
 # 2026-09-27 用本机那份 0.1.7-rc.2 核对过。
 REPO_URL = "https://github.com/deepseek-ai/deepseek-harness"
 
+OFFICIAL_REGISTRY = "https://registry.npmjs.org"
+MIRROR_REGISTRY = "https://registry.npmmirror.com"
 REGISTRY_CANDIDATES = [
-    "https://registry.npmjs.org",
-    "https://registry.npmmirror.com",
+    OFFICIAL_REGISTRY,
+    MIRROR_REGISTRY,
 ]
+
+# 「用哪个源下载」：auto（默认）/ official / mirror / 直接一个 http 地址。
+# 为什么要这个开关（2026-09-28 实测教训）：官方源当天发新版时，npmmirror 常常只同步了一半
+# —— dsh@0.2.0-rc.1 它有了，可 12 个 @deepseek-ai/dsh-* 子包还没到（查了 259 个包，镜像缺 12）。
+# 这时"查版本走官方、安装走镜像"必然在第一个缺的子包上 npm ETARGET 失败。所以两条规矩：
+#   ① 查版本用哪个源，安装就用哪个源；
+#   ② 装的时候如果那个源还没同步全，允许换另一个源重试一次。
+REGISTRY_ALIASES = {
+    "": "",
+    "auto": "",
+    "official": OFFICIAL_REGISTRY,
+    "npmjs": OFFICIAL_REGISTRY,
+    "npm": OFFICIAL_REGISTRY,
+    "mirror": MIRROR_REGISTRY,
+    "npmmirror": MIRROR_REGISTRY,
+    "taobao": MIRROR_REGISTRY,
+}
+REGISTRY_CHOICES = ("auto", "official", "mirror")
+REGISTRY_LABELS = {
+    OFFICIAL_REGISTRY: "官方源 npmjs.org",
+    MIRROR_REGISTRY: "镜像源 npmmirror.com",
+}
 
 # npm 11 起 install script 默认需要显式授权（RFC npm/rfcs#868）。
 # 这张表必须写在**目标目录的 package.json 的 allowScripts 对象**里：
@@ -765,13 +789,64 @@ def lane_states(cfg: dict, ttl: float = 0.5) -> dict[str, dict | None]:
 # ======================= 版本查询（纯脚本 HTTP） =======================
 
 
-def fetch_index(cfg: dict, name: str = PKG) -> tuple[dict, str]:
+def registry_label(reg: str) -> str:
+    """给人看的源名字（认不出的原样返回，便于自定义地址）。"""
+    return REGISTRY_LABELS.get(reg, reg or "（未指定）")
+
+
+def registry_plan(cfg: dict, choice: str | None = None) -> list[str]:
+    """按顺序该试哪些源：**第一个是首选，后面是失败后的退路**。
+
+    choice 省略时看 lanes.json 的 registry。取值：auto / official / mirror / 一个 http 地址，
+    大小写不敏感，空串＝auto。自定义地址不安排退路（可能是内网源，不该偷偷去公网问）。
+    """
+    raw = str(choice if choice is not None else cfg.get("registry") or "").strip()
+    key = raw.lower()
+    if key in REGISTRY_ALIASES:
+        chosen = REGISTRY_ALIASES[key]
+        if not chosen:
+            return list(REGISTRY_CANDIDATES)
+        return [chosen] + [r for r in REGISTRY_CANDIDATES if r != chosen]
+    if raw.startswith("http"):
+        return [raw.rstrip("/")]
+    raise ValueError(
+        f"认不出的下载源 {raw!r}：可用 auto / official / mirror，或一个 http(s) 地址"
+    )
+
+
+def registry_plan_after(reg: str, cfg: dict, choice: str | None = None) -> list[str]:
+    """已经知道 `reg` 能答话时，把它排第一，其余候选跟在后面当退路。
+
+    查版本和装版本必须用**同一个源**（2026-09-28 那次 ETARGET 就是这么来的），所以查到版本的
+    那个源要一路带到安装那一步。
+    """
+    return [reg] + [r for r in registry_plan(cfg, choice) if r != reg]
+
+
+def registry_choice_of(cfg: dict) -> str:
+    """lanes.json 里存的值 → 界面上的三选一（auto / official / mirror）。"""
+    key = str(cfg.get("registry") or "").strip().lower()
+    if key in ("official", "npmjs", "npm"):
+        return "official"
+    if key in ("mirror", "npmmirror", "taobao"):
+        return "mirror"
+    return "auto"
+
+
+def registry_value_of(choice: str) -> str:
+    """界面上的三选一 → 写进 lanes.json 的值（auto 存空串；自定义地址原样存）。"""
+    return REGISTRY_ALIASES.get(str(choice or "").strip().lower(), str(choice or "").strip())
+
+
+def fetch_index(cfg: dict, name: str = PKG,
+                registries: list[str] | None = None) -> tuple[dict, str]:
     """查询 registry，返回 (packument, 实际使用的 registry)。
 
     官方 registry 在本机会握手超时（schannel/网络原因），所以首个候选只等 8 秒就换下一个。
     `name` 默认是 dsh 本体；插件市场更新时用它查 `dshmarket`。
+    `registries` 传了就按它来（升级时会把"查到版本的那个源"排到最前）。
     """
-    regs = [cfg["registry"]] if cfg.get("registry") else list(REGISTRY_CANDIDATES)
+    regs = list(registries) if registries else registry_plan(cfg)
     quoted = urllib.parse.quote(name, safe="")
     last: Exception | None = None
     for index, reg in enumerate(regs):
@@ -981,7 +1056,61 @@ def bin_js(vdir: Path) -> Path:
     return vdir / "node_modules" / "@deepseek-ai" / "dsh" / "lib" / "bin.js"
 
 
-def install_version(cfg: dict, version: str, follow: bool = True) -> Path:
+def npm_install_tree(cfg: dict, tree: Path, version: str, log_path: Path,
+                     registries: list[str] | None = None, follow: bool = True,
+                     what: str = "安装") -> str:
+    """在 `tree` 里装 `PKG@version`，返回**真正装成的那个源**。
+
+    两条规矩都来自 2026-09-28 那次失败的实测：
+      1. **每次都显式给 `--registry`**：查版本用哪个源，装就用哪个源。以前不给，
+         npm 就退回你 `.npmrc` 里的镜像，于是"查到 0.2.0-rc.1、镜像上却缺它的子包"→ ETARGET；
+      2. 失败原因若是"这个源上没有这个版本/它的依赖"（npm 的 ETARGET / notarget），
+         自动换下一个候选源重试一次 —— 官方当天发新版时镜像常常只同步一半，而失败发生在
+         npm 写盘之前（日志里停在 reify:loadTrees，实测安装树没被动过），换源重试是安全的。
+    """
+    node = find_node(cfg)
+    npm_cli = find_npm_cli(cfg, node)
+    if not node or not npm_cli:
+        raise RuntimeError("找不到 node 或 npm-cli.js，请检查 Node.js 安装（可用 doctor 子命令）")
+    env = build_npm_env(cfg, node)
+    regs = list(registries) if registries else registry_plan(cfg)
+    last = ""
+    for index, reg in enumerate(regs):
+        cmd = [
+            node,
+            npm_cli,
+            "install",
+            "--prefix",
+            str(tree),
+            f"{PKG}@{version}",
+            "--registry",
+            reg,
+            "--no-audit",
+            "--no-fund",
+            "--loglevel=notice",
+        ]
+        info(col(f"正在{what} {PKG}@{version} → {tree}", C.BOLD))
+        info(f"  下载源    : {registry_label(reg)}"
+             + ("（首选）" if index == 0 else "（换源重试）"))
+        info(col(f"（日志：{log_path}）", C.GRAY))
+        code = run_logged(cmd, cwd=tree, env=env, log_path=log_path, follow=follow)
+        got = installed_version(tree)
+        if code == 0 and got == version:
+            return reg
+        last = f"npm 退出码 {code}，实际装到 {got!r}"
+        tail = "\n".join(tail_lines(log_path, 80))
+        nxt = regs[index + 1] if index + 1 < len(regs) else None
+        if nxt and ("ETARGET" in tail or "notarget" in tail):
+            warn(f"{registry_label(reg)} 上这个版本的依赖还不齐（npm ETARGET）——"
+                 f"换 {registry_label(nxt)} 重试一次")
+            info(col("      （这次失败发生在 npm 写盘之前，安装树没被动过）", C.GRAY))
+            continue
+        break
+    raise RuntimeError(f"{what}失败（{last}）。完整日志：{log_path}")
+
+
+def install_version(cfg: dict, version: str, follow: bool = True,
+                    registries: list[str] | None = None) -> Path:
     """把指定版本装进 <root>/versions/<version>；已装且版本一致则直接复用。"""
     p = ensure_layout(cfg)
     vdir = p["versions"] / version
@@ -990,36 +1119,12 @@ def install_version(cfg: dict, version: str, follow: bool = True) -> Path:
         ok(f"版本 {version} 已安装，直接复用：{vdir}")
         return vdir
 
-    node = find_node(cfg)
-    npm_cli = find_npm_cli(cfg, node)
-    if not node or not npm_cli:
-        raise RuntimeError("找不到 node 或 npm-cli.js，请检查 Node.js 安装（可用 doctor 子命令）")
-
     write_lane_package_json(vdir, version, cfg["allow_scripts"])
-    env = build_npm_env(cfg, node)
     log = p["logs"] / f"install-{version}.log"
-    cmd = [
-        node,
-        npm_cli,
-        "install",
-        "--prefix",
-        str(vdir),
-        f"{PKG}@{version}",
-        "--no-audit",
-        "--no-fund",
-        "--loglevel=notice",
-    ]
-    info(col(f"正在安装 {PKG}@{version} → {vdir}", C.BOLD))
-    info(col(f"（日志：{log}）", C.GRAY))
-    code = run_logged(cmd, cwd=vdir, env=env, log_path=log, follow=follow)
-    got = installed_version(vdir)
-    if code != 0 or got != version:
-        raise RuntimeError(
-            f"安装失败（npm 退出码 {code}，实际装到 {got!r}）。完整日志：{log}"
-        )
+    npm_install_tree(cfg, vdir, version, log, registries=registries, follow=follow)
     if not bin_js(vdir).is_file():
         raise RuntimeError(f"安装完成但入口缺失：{bin_js(vdir)}")
-    ok(f"已安装 {PKG}@{got}")
+    ok(f"已安装 {PKG}@{version}")
     return vdir
 
 
@@ -1336,9 +1441,18 @@ def cmd_doctor(cfg: dict, args) -> int:
     info(f"  默认工作区  : {cfg.get('default_cwd')}")
     info(f"  端口范围    : {cfg['port_range'][0]}-{cfg['port_range'][1]}")
     try:
-        packument, reg = fetch_index(cfg)
+        plan = registry_plan(cfg)
+        extra = "" if len(plan) == 1 else f"（首选；装不上会退到 {registry_label(plan[1])}）"
+        info(f"  下载源      : {registry_label(plan[0])}{extra}"
+             f"   [lanes.json registry={cfg.get('registry')!r}]")
+    except ValueError as exc:
+        fail(f"下载源配置有问题：{exc}")
+    try:
+        regs = registry_plan(cfg, getattr(args, "registry", None))
+        packument, reg = fetch_index(cfg, registries=regs)
         tags = ", ".join(f"{k}={v}" for k, v in sorted(packument.get("dist-tags", {}).items()))
-        ok(f"registry 可达（{reg}）：{len(packument.get('versions', {}))} 个版本 / {tags}")
+        ok(f"registry 可达（{registry_label(reg)}）："
+           f"{len(packument.get('versions', {}))} 个版本 / {tags}")
     except Exception as exc:
         fail(f"registry 不可达：{exc}")
     if CONFIG_PATH.exists():
@@ -1349,11 +1463,16 @@ def cmd_doctor(cfg: dict, args) -> int:
 
 
 def cmd_versions(cfg: dict, args) -> int:
-    packument, reg = fetch_index(cfg)
+    try:
+        regs = registry_plan(cfg, getattr(args, "registry", None))
+    except ValueError as exc:
+        fail(str(exc))
+        return 1
+    packument, reg = fetch_index(cfg, registries=regs)
     tags = packument.get("dist-tags", {})
     versions = sorted_versions(packument)
     times = packument.get("time", {})
-    info(col(f"── npm 上的 {PKG}（来源 {reg}）──", C.BOLD))
+    info(col(f"── npm 上的 {PKG}（来源 {registry_label(reg)}）──", C.BOLD))
     info(col("  dist-tags：", C.CYAN) + ", ".join(f"{k}={v}" for k, v in sorted(tags.items())))
     info("")
     tag_of = {}
@@ -1376,8 +1495,14 @@ def cmd_versions(cfg: dict, args) -> int:
 def cmd_create(cfg: dict, args) -> int:
     p = ensure_layout(cfg)
     lane = args.lane
+    choice = getattr(args, "registry", None)
     try:
-        packument, _ = fetch_index(cfg)
+        regs = registry_plan(cfg, choice)
+    except ValueError as exc:
+        fail(str(exc))
+        return 1
+    try:
+        packument, reg = fetch_index(cfg, registries=regs)
         version = resolve_tag(packument, args.version)
     except Exception as exc:
         fail(f"无法解析版本 {args.version!r}：{exc}")
@@ -1392,7 +1517,8 @@ def cmd_create(cfg: dict, args) -> int:
                 f"要改写请加 --force，或换个 lane 名。"
             )
             return 1
-    vdir = install_version(cfg, version, follow=args.follow)
+    vdir = install_version(cfg, version, follow=args.follow,
+                           registries=registry_plan_after(reg, cfg, choice))
     home = paths(cfg)["homes"] / lane
     home.mkdir(parents=True, exist_ok=True)
     port = args.port or (cfg["lanes"].get(lane, {}) or {}).get("port") or pick_port(cfg)
@@ -1410,6 +1536,7 @@ def cmd_create(cfg: dict, args) -> int:
     info("")
     ok(f"lane「{lane}」就绪")
     info(f"      版本      : {version}")
+    info(f"      下载源    : {registry_label(reg)}")
     info(f"      安装目录  : {vdir}")
     info(f"      DSH_HOME : {home}")
     info(f"      端口      : {port}")
@@ -2491,7 +2618,8 @@ def lane_upgrade_plan(cfg: dict, lane: str) -> dict:
     return {"mode": "external", "dir": idir, "why": f"{kind}（{idir}）"}
 
 
-def npm_install_in_place(cfg: dict, tree: Path, version: str, follow: bool = True) -> None:
+def npm_install_in_place(cfg: dict, tree: Path, version: str, follow: bool = True,
+                         registries: list[str] | None = None) -> str:
     """在**已有的**安装树里就地换版本（`npm install --prefix <tree> <pkg>@<version>`）。
 
     副本走这条路的关键理由是**路径不变**：DSH 的 HOME 里那些 junction 记的是绝对路径，
@@ -2499,23 +2627,10 @@ def npm_install_in_place(cfg: dict, tree: Path, version: str, follow: bool = Tru
     就地升级则一条都不用动。
     """
     p = ensure_layout(cfg)
-    node = find_node(cfg)
-    npm_cli = find_npm_cli(cfg, node)
-    if not node or not npm_cli:
-        raise RuntimeError("找不到 node 或 npm-cli.js，请检查 Node.js 安装（可用 doctor 子命令）")
     write_lane_package_json(tree, version, cfg.get("allow_scripts") or {})
-    env = build_npm_env(cfg, node)
     log = p["logs"] / f"upgrade-{tree.name}-{version}.log"
-    cmd = [
-        node, npm_cli, "install", "--prefix", str(tree), f"{PKG}@{version}",
-        "--no-audit", "--no-fund", "--loglevel=notice",
-    ]
-    info(col(f"正在原地安装 {PKG}@{version} → {tree}", C.BOLD))
-    info(col(f"（日志：{log}）", C.GRAY))
-    code = run_logged(cmd, cwd=tree, env=env, log_path=log, follow=follow)
-    got = installed_version(tree)
-    if code != 0 or got != version:
-        raise RuntimeError(f"原地安装失败（npm 退出码 {code}，实际装到 {got!r}）。完整日志：{log}")
+    return npm_install_tree(cfg, tree, version, log, registries=registries,
+                            follow=follow, what="原地安装")
 
 
 def upgrade_checks(cfg: dict, lane: str, version: str, tree: Path,
@@ -2584,9 +2699,16 @@ def cmd_upgrade(cfg: dict, args) -> int:
         return 1
     registry_note = ""
     packument = None
+    choice = getattr(args, "registry", None)
+    reg = ""
     try:
-        packument, reg = fetch_index(cfg)
-        registry_note = f"（registry {reg}）"
+        regs = registry_plan(cfg, choice)
+    except ValueError as exc:
+        fail(str(exc))
+        return 1
+    try:
+        packument, reg = fetch_index(cfg, registries=regs)
+        registry_note = f"（来源 {registry_label(reg)}）"
     except Exception as exc:  # noqa: BLE001 —— 离线也可能只是"目标版本早装好了"
         if re.match(r"^\d+\.\d+\.\d+", str(spec)):
             version = str(spec)
@@ -2606,6 +2728,10 @@ def cmd_upgrade(cfg: dict, args) -> int:
             return 1
     tagnote = f"{spec} → {version} " if str(spec) != version else f"{version} "
     info(col(f"  目标版本  : {tagnote}{registry_note}", C.CYAN))
+
+    # 查到版本用的是哪个源，就一路带到安装那一步（查/装必须同源）；它要是只同步了一半，
+    # npm_install_tree 会自动换另一个候选源重试一次。
+    install_regs = registry_plan_after(reg, cfg, choice) if reg else registry_plan(cfg, choice)
 
     current = str(data.get("version") or "")
     before = installed_version(plan["dir"]) or current
@@ -2627,6 +2753,9 @@ def cmd_upgrade(cfg: dict, args) -> int:
             steps.append(f"把登记改成 {version}；旧树 {plan['dir']} 留着 → 退回是秒级的")
         else:
             steps.append(f"就地 npm install --prefix {plan['dir']} {PKG}@{version}（路径不变）")
+        steps.insert(0, f"从 {registry_label(install_regs[0])} 查版本并下载"
+                        + (f"；那个源缺东西就换 {registry_label(install_regs[1])} 重试一次"
+                           if len(install_regs) > 1 else ""))
         if running:
             steps.append(f"先停掉它（现在跑着：pid {running.get('pid')}，端口 {running.get('port')}）"
                          "—— 不带 --stop 的话真执行会被拒绝")
@@ -2656,9 +2785,9 @@ def cmd_upgrade(cfg: dict, args) -> int:
     started = time.time()
     try:
         if plan["mode"] == "tree":
-            vdir = install_version(cfg, version)
+            vdir = install_version(cfg, version, registries=install_regs)
         else:
-            npm_install_in_place(cfg, plan["dir"], version)
+            npm_install_in_place(cfg, plan["dir"], version, registries=install_regs)
             vdir = plan["dir"]
     except Exception as exc:  # noqa: BLE001
         fail(f"安装失败：{exc}")
@@ -2693,9 +2822,9 @@ def cmd_upgrade(cfg: dict, args) -> int:
         warn(f"这次升级不成立 —— 自动退回 {before}…")
         try:
             if plan["mode"] == "tree":
-                install_version(cfg, before)
+                install_version(cfg, before, registries=install_regs)
             else:
-                npm_install_in_place(cfg, plan["dir"], before)
+                npm_install_in_place(cfg, plan["dir"], before, registries=install_regs)
         except Exception as exc:  # noqa: BLE001
             fail(f"自动退回也失败了：{exc}")
             info(col(f"      手动退回： py {me} upgrade {lane} {before}", C.CYAN))
@@ -5891,6 +6020,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor", help="环境自检：node / npm / root 可写 / registry 可达")
     p_ver = sub.add_parser("versions", help="查询 npm 上可用的 dsh 版本与 dist-tag")
     p_ver.add_argument("--all", action="store_true", help="列出全部版本（默认最近 15 个）")
+    p_ver.add_argument("--registry", metavar="auto|official|mirror|URL",
+                       help="查哪个 npm 源（默认沿用 lanes.json；空/auto＝先官方再镜像）")
 
     p_create = sub.add_parser("create", help="安装指定版本并登记为一条 lane")
     p_create.add_argument("lane", help="lane 名，例如 stable / next / last")
@@ -5899,6 +6030,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_create.add_argument("--force", action="store_true", help="lane 已存在时覆盖其版本")
     p_create.add_argument("--no-follow", dest="follow", action="store_false",
                           help="安装时不实时跟随日志")
+    p_create.add_argument("--registry", metavar="auto|official|mirror|URL",
+                          help="从哪个 npm 源查版本并下载：auto（默认，先官方再镜像）/ "
+                               "official / mirror / 一个地址。缺依赖会自动换另一个源重试")
 
     p_open = sub.add_parser("open", help="打开一条 lane（lane 名或已安装的版本号）")
     p_open.add_argument("target", help="lane 名或版本号")
@@ -5984,6 +6118,9 @@ def build_parser() -> argparse.ArgumentParser:
                            help="跳过「升完启动一次」的冒烟验证（默认会做，起不来就自动退回）")
     p_upgrade.add_argument("--dry-run", dest="dry_run", action="store_true",
                            help="只显示会做什么，不动任何东西")
+    p_upgrade.add_argument("--registry", metavar="auto|official|mirror|URL",
+                           help="从哪个 npm 源查版本并下载（默认沿用 lanes.json；"
+                                "查和装一定用同一个源，缺依赖自动换另一个源重试）")
 
     p_verify = sub.add_parser(
         "verify", help="核对一条 lane 的隔离与内容（clone 之后、升级之后再各跑一次）"

@@ -429,6 +429,58 @@ class LauncherApp:
         btn.bind("<Leave>", lambda _e: btn.configure(font=(FONT_UI, 9)))
         return btn
 
+    # ── 下载源选择（新建 / 升级共用） ─────────────────────────────────────────
+    def registry_row(self, parent, cfg: dict, pady=(12, 0)):
+        """「下载源」三选一 ＋「记住这个选择」。返回 (取值 StringVar, 记住 BooleanVar)。
+
+        为什么把它摆到明面上（2026-09-28 实测）：官方源当天发新版时，镜像常常只同步了一半
+        —— dsh@0.2.0-rc.1 镜像有了，可它的 12 个 @deepseek-ai/dsh-* 子包还没到（查 259 个包）。
+        以前"查版本走官方、下载走镜像"两边不一致，就会 npm ETARGET 装不上。现在的规矩：
+        选谁就**用它查版本、也用它下载**；万一它还没同步全，会自动换另一个源重试一次（写进日志）。
+        """
+        box = tk.Frame(parent, bg=BG)
+        box.pack(fill="x", padx=18, pady=pady)
+        var = tk.StringVar(value=core.registry_choice_of(cfg))
+        remember = tk.BooleanVar(value=False)
+        tk.Label(box, text="下载源", bg=BG, fg=MUTED, font=(FONT_UI, 9)).pack(anchor="w")
+        row = tk.Frame(box, bg=BG)
+        row.pack(anchor="w", pady=(2, 0))
+        for value, text in (
+            ("auto", "自动（先官方，缺东西再换镜像）"),
+            ("official", "官方源 npmjs.org"),
+            ("mirror", "镜像源 npmmirror.com（国内快）"),
+        ):
+            tk.Radiobutton(
+                row, text=text, value=value, variable=var, bg=BG, fg=TEXT, selectcolor=CARD,
+                activebackground=BG, activeforeground=TEXT, font=(FONT_UI, 9),
+                highlightthickness=0, cursor="hand2",
+            ).pack(side="left", padx=(0, 14))
+        tk.Checkbutton(
+            box, text="记住这个选择（写进 lanes.json，以后新建/升级默认用它）",
+            variable=remember, bg=BG, fg=MUTED, selectcolor=CARD,
+            activebackground=BG, activeforeground=TEXT, font=(FONT_UI, 9),
+            highlightthickness=0, cursor="hand2",
+        ).pack(anchor="w", pady=(2, 0))
+        raw = str(cfg.get("registry") or "").strip()
+        if raw.lower() not in ("", "auto", "official", "mirror", "npmjs", "npm", "npmmirror", "taobao"):
+            tk.Label(box, text=f"（lanes.json 里现在写的是自定义地址 {raw}；不想换掉就别勾「记住」）",
+                     bg=BG, fg=AMBER, font=(FONT_UI, 8)).pack(anchor="w")
+        return var, remember
+
+    def _save_registry_choice(self, var, remember) -> None:
+        """勾了「记住」才写 lanes.json；不勾就只是这一次有效，不动你的全局设置。"""
+        if not remember.get():
+            return
+        try:
+            cfg = core.load_config()
+            cfg["registry"] = core.registry_value_of(var.get())
+            core.save_config(cfg)
+            self.log(f"下载源已记住：{core.registry_choice_of(cfg)}"
+                     + (f"（{cfg['registry']}）" if cfg["registry"] else "（auto＝先官方再镜像）"),
+                     "muted")
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"[!!] 记住下载源失败：{exc}", "warn")
+
     # ── 顶部 ────────────────────────────────────────────────────────────────
     def _build_header(self) -> None:
         head = tk.Frame(self.root, bg=BG)
@@ -1012,7 +1064,7 @@ class LauncherApp:
 
         def worker() -> None:
             try:
-                packument, _reg = core.fetch_index(core.load_config())
+                packument, reg = core.fetch_index(core.load_config())
             except Exception as exc:  # noqa: BLE001
                 # 用主线程轮询的队列回话（而不是 worker 里调 root.after）：
                 # 窗口不在 mainloop 里时（自检、正在关闭）after 会直接抛 RuntimeError。
@@ -1022,7 +1074,8 @@ class LauncherApp:
             order = ["latest", "next", "alpha"]
             keys = [k for k in order if k in tags] + sorted(k for k in tags if k not in order)
             bits = [f"{tag} {tags[tag]}" + ("√" if str(tags[tag]) in installed else "") for tag in keys]
-            text = "npm 上：" + "　·　".join(bits)
+            # 把实际答话的源写在这儿：镜像常常落后官方一两天，"这行数字从哪来"必须看得见
+            text = f"npm 上（{core.registry_label(reg)}）：" + "　·　".join(bits)
             self.q.put(("callback", lambda: self._remote_done(text, MUTED)))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1608,7 +1661,7 @@ class LauncherApp:
         dlg.title("升级版本")
         dlg.configure(bg=BG)
         dlg.transient(self.root)
-        w, h = 700, 540
+        w, h = 700, 640
         x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
         y = self.root.winfo_rooty() + 50
         dlg.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
@@ -1637,6 +1690,8 @@ class LauncherApp:
                      "这个窗口有意不动它。要动它得单独一步、单独确认。",
                 fg=RED,
             )
+
+        reg_var, reg_remember = self.registry_row(dlg, cfg, pady=(12, 0))
 
         tk.Label(dlg, text="从 registry 挑一版（点一下填进下面，也可以自己手打版本号）",
                  bg=BG, fg=MUTED, font=(FONT_UI, 9), anchor="w").pack(anchor="w", padx=18, pady=(12, 2))
@@ -1689,14 +1744,17 @@ class LauncherApp:
                     "升级",
                     f"把「{lane}」升到 {version}？\n\n"
                     f"当前 {data.get('version') or '?'} → 装到 {plan['dir']}\n"
+                    f"下载源：{core.registry_label(core.registry_plan(cfg, reg_var.get())[0])}\n"
                     "会做：升级 → 核对 → 启动冒烟；起不来自动退回原版本。",
                     parent=dlg,
                 ):
                     return
             args = argparse.Namespace(
                 lane=lane, version=version, rollback=rollback, stop=True,
-                no_boot_check=False, dry_run=dry_run,
+                no_boot_check=False, dry_run=dry_run, registry=reg_var.get(),
             )
+            if not dry_run:
+                self._save_registry_choice(reg_var, reg_remember)
             title = f"升级 {lane}" + ("（只看会做什么）" if dry_run else "")
             dlg.destroy()
             self.run_job(title, lambda: core.cmd_upgrade(core.load_config(), args))
@@ -1715,9 +1773,10 @@ class LauncherApp:
             tk.Label(foot, text="外部安装：本窗口不动它", bg=BG, fg=RED,
                      font=(FONT_UI, 9)).pack(side="right", padx=(0, 14))
 
-        def load() -> None:
+        def load(choice: str) -> None:
             try:
-                packument, reg = core.fetch_index(cfg)
+                plan = core.registry_plan(cfg, choice)
+                packument, reg = core.fetch_index(cfg, registries=plan)
                 versions = core.sorted_versions(packument)
                 tags = packument.get("dist-tags", {})
             except Exception as exc:  # noqa: BLE001
@@ -1762,7 +1821,14 @@ class LauncherApp:
 
             self.root.after(0, apply)
 
-        threading.Thread(target=load, daemon=True).start()
+        # 换源就重查一次版本列表（列表和「最新版」都跟着源走）。
+        # Tk 变量只能在主线程读，所以在这里读好再交给子线程。
+        def reload(*_a) -> None:
+            choice = reg_var.get()
+            threading.Thread(target=load, args=(choice,), daemon=True).start()
+
+        reg_var.trace_add("write", reload)
+        reload()
 
 
     def market_dialog(self, lane: str) -> None:
@@ -2091,7 +2157,7 @@ class LauncherApp:
         dlg.configure(bg=BG)
         dlg.transient(self.root)
         dlg.resizable(False, False)
-        w, h = 540, 460
+        w, h = 540, 580
         x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
         y = self.root.winfo_rooty() + 90
         dlg.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
@@ -2146,6 +2212,8 @@ class LauncherApp:
             justify="left",
         ).pack(anchor="w", padx=10, pady=(0, 7))
 
+        reg_var, reg_remember = self.registry_row(dlg, cfg_now, pady=(12, 0))
+
         form = tk.Frame(dlg, bg=BG)
         form.pack(fill="x", padx=20, pady=14)
         form.columnconfigure(1, weight=1)
@@ -2184,10 +2252,10 @@ class LauncherApp:
 
         self.ver_combo.bind("<<ComboboxSelected>>", on_pick)
 
-        def load_versions() -> None:
-            hint.configure(text="正在查询 npm 上可用的版本…", fg=MUTED)
+        def load_versions(choice: str) -> None:
             try:
-                packument, reg = core.fetch_index(core.load_config())
+                plan = core.registry_plan(core.load_config(), choice)
+                packument, reg = core.fetch_index(core.load_config(), registries=plan)
             except Exception as exc:  # noqa: BLE001
                 self.root.after(0, lambda: hint.configure(text=f"查询失败：{exc}（可直接手输版本号）", fg=RED))
                 return
@@ -2208,6 +2276,12 @@ class LauncherApp:
 
             self.root.after(0, apply)
 
+        # 换源就重查一次（Tk 变量只在主线程读）
+        def reload_versions(*_a) -> None:
+            hint.configure(text="正在查询 npm 上可用的版本…", fg=MUTED)
+            choice = reg_var.get()
+            threading.Thread(target=load_versions, args=(choice,), daemon=True).start()
+
         def do_create() -> None:
             lane = name_var.get().strip()
             ver_text = ver_var.get().strip()
@@ -2223,7 +2297,9 @@ class LauncherApp:
                     return
             port_txt = port_var.get().strip()
             port = int(port_txt) if port_txt.isdigit() else None
-            args = argparse.Namespace(lane=lane, version=ver, port=port, force=True, follow=True)
+            args = argparse.Namespace(lane=lane, version=ver, port=port, force=True, follow=True,
+                                      registry=reg_var.get())
+            self._save_registry_choice(reg_var, reg_remember)
 
             def job() -> None:
                 core.cmd_create(core.load_config(), args)
@@ -2235,9 +2311,10 @@ class LauncherApp:
         btns.pack(fill="x", padx=20, pady=(4, 16), side="bottom")
         self.button(btns, "开始安装", do_create, primary=True).pack(side="right")
         self.button(btns, "取消", dlg.destroy).pack(side="right", padx=6)
-        self.button(btns, "重新查询版本", load_versions).pack(side="left")
+        self.button(btns, "重新查询版本", reload_versions).pack(side="left")
 
-        threading.Thread(target=load_versions, daemon=True).start()
+        reg_var.trace_add("write", reload_versions)
+        reload_versions()
 
     # ── 关闭 ────────────────────────────────────────────────────────────────
     def _save_geometry(self) -> None:
@@ -2305,6 +2382,8 @@ _REQUIRED_ACTIONS = (
     "market_dialog",
     "chat_dialog",
     "new_version_dialog",
+    "registry_row",
+    "_save_registry_choice",
     "adopt_install",
     "kill_instance",
     "open_url",
