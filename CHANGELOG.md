@@ -5,6 +5,27 @@ exe 不进仓库（`.gitignore` 排除了 `dist/`），要分享请把 `dist\*-o
 
 ---
 
+## v0.2.1 — 2026-10-01
+
+### 修复：接管型 lane 的版本号不再「停在登记那一刻」
+
+现象：主要版本 `global` 是**接管的** npm 全局安装（`installDir` 指向
+`%APPDATA%\npm\node_modules\@deepseek-ai\dsh`）。自己 `npm i -g @deepseek-ai/dsh@0.2.0-rc.2`
+升级完，启动器卡片上还写着 `0.1.7-rc.2` —— 因为台账（`lanes.json` 里的 `version`）只在
+create / adopt 那一刻写过，之后没人再读安装树。
+
+现在：GUI 每轮刷新、每条 CLI 命令启动时，都会**从安装树里读一次真实版本**，与台账不一致就
+自动更正并写回 `lanes.json`（日志/终端里留一行说明）。接管型 lane 的树在启动器之外，
+所以只更正台账、**不碰安装树**。
+
+判定谁是事实的规矩：以安装树里的 `package.json` 为准 ——
+常规 lane 是 `<root>\versions\<版本>\node_modules\@deepseek-ai\dsh\package.json`，
+副本是 `<root>\clones\<lane>\node_modules\...`，接管型直接是 `installDir\package.json`
+（并核对包名，免得把副本自己的 `dsh-lane-<版本>` 当成真实版本）。
+台账写不进去（盘不可写）时，界面这一轮仍然显示事实，下次刷新再试。
+
+---
+
 ## v0.2.0 — 2026-09-28
 
 ### 新增：新建 / 升级可以自己选下载源（官方源 / 镜像源）

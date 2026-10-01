@@ -676,6 +676,8 @@ class LauncherApp:
             return self._snap
 
         cfg = core.load_config()
+        # 台账自愈：接管型 lane（npm 全局那份）是你自己在升级的，登记版本要跟上事实
+        version_fixes = core.sync_lane_versions(cfg)
         states = core.lane_states(cfg)          # 复用同一份 TCP 表，不再每条 lane 各探一次
         try:
             foreign = core.discover_instances(cfg)
@@ -707,6 +709,7 @@ class LauncherApp:
             "foreign": foreign,
             "installs": installs,
             "signature": signature,
+            "version_fixes": version_fixes,
         }
         self._snap_at = now
         return self._snap
@@ -732,6 +735,10 @@ class LauncherApp:
             return
         self._sig = snap["signature"]
         self.cfg = snap["cfg"]
+        for fix in snap.get("version_fixes") or []:
+            self.log(f"台账已更正：lane「{fix['lane']}」登记的是 {fix['was'] or '?'}，"
+                     f"安装树里实际是 {fix['now']}（接管型 lane 是你自己在升级，启动器只读不改）",
+                     "ok" if fix["now"] else "muted")
         for child in self.list_frame.winfo_children():
             child.destroy()
 
@@ -1653,6 +1660,7 @@ class LauncherApp:
         真正干活的是 `core.cmd_upgrade`（和 CLI 同一条路），输出进下面的日志面板。
         """
         cfg = core.load_config()
+        core.sync_lane_versions(cfg)      # 「当前版本」必须是安装树里的事实，不是旧台账
         data = (cfg.get("lanes") or {}).get(lane) or {}
         plan = core.lane_upgrade_plan(cfg, lane)
         running = core.lane_runtime(cfg, lane)

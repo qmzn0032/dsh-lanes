@@ -1052,6 +1052,67 @@ def installed_version(vdir: Path) -> str | None:
         return None
 
 
+def package_version_at(path: Path) -> str | None:
+    """`path` **本身就是** dsh 包目录时，读出它的版本（接管型 lane 的安装树长这样）。
+
+    必须核对包名：副本那种前缀树的根目录也有个 package.json（名字是 `dsh-lane-<版本>`、
+    版本是 `0.0.0`），不核对就会把 `0.0.0` 当成真实版本。
+    """
+    manifest_path = path / "package.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if str(data.get("name") or "") != PKG:
+        return None
+    return str(data.get("version") or "") or None
+
+
+def actual_lane_version(cfg: dict, lane: str) -> str | None:
+    """从**安装树里**读这条 lane 的真实版本；读不出来（树被删了/路径不通）返回 None。
+
+    台账（lanes.json 的 `version`）是"登记那一刻"的版本。接管型 lane（`installDir` 指向
+    npm 全局那份或桌面版）的树是**你自己在升级**的 —— `npm i -g @deepseek-ai/dsh@0.2.0-rc.2`
+    之后台账还停在 0.1.7，启动器显示的就不是事实（2026-10-01 你遇到的就是这个）。
+    """
+    try:
+        base = lane_install_dir(cfg, lane)
+    except Exception:  # noqa: BLE001 —— lane_install_dir 依赖 version 字段，缺了也不许炸
+        return None
+    return package_version_at(base) or installed_version(base)
+
+
+def sync_lane_versions(cfg: dict, persist: bool = True) -> list[dict]:
+    """把台账里的版本对齐到安装树里的真实版本（自愈，**绝不抛异常**）。
+
+    返回改动列表 `[{"lane","was","now"}]`。`persist=True` 时写回 lanes.json；
+    写不了（盘不可写）就只改内存里的这份，下次刷新再试 —— 界面因此仍然显示事实。
+
+    只更正台账，**不碰任何安装树**：接管型 lane 的树在启动器之外，启动器只能读。
+    """
+    changes: list[dict] = []
+    try:
+        for lane, data in list((cfg.get("lanes") or {}).items()):
+            if not isinstance(data, dict):
+                continue
+            was = str(data.get("version") or "")
+            now = actual_lane_version(cfg, lane)
+            if not now or now == was:
+                continue
+            data["version"] = now
+            changes.append({"lane": lane, "was": was, "now": now})
+    except Exception:  # noqa: BLE001 —— 这条链路在 GUI 的刷新路径上，不许把窗口带崩
+        return changes
+    if changes and persist:
+        try:
+            save_config(cfg)
+        except Exception:  # noqa: BLE001
+            pass
+    return changes
+
+
 def bin_js(vdir: Path) -> Path:
     return vdir / "node_modules" / "@deepseek-ai" / "dsh" / "lib" / "bin.js"
 
@@ -6254,6 +6315,13 @@ def main() -> int:
     cfg = load_config()
     if getattr(args, "root", None):
         cfg["root"] = args.root
+
+    # 台账自愈：接管型 lane（`installDir` 指向 npm 全局那份）是你自己在 `npm i -g` 升级的，
+    # 登记版本必须跟着安装树的事实走。放在这里而不是塞进各命令里 —— 所有子命令走同一条路，
+    # 屏幕上的版本号就不会一处一个说法。
+    for fix in sync_lane_versions(cfg):
+        info(col(f"  [台账] lane「{fix['lane']}」登记的是 {fix['was'] or '?'}，"
+                 f"安装树里实际是 {fix['now']} —— 已更正（安装树在启动器之外，只读不改）", C.GRAY))
 
     handlers = {
         "doctor": cmd_doctor,
