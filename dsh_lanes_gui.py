@@ -239,6 +239,10 @@ class LaneCard(tk.Frame):
         self.app.link_button(
             acts, "备份对话…", lambda: self.app.chat_dialog(self.name), fg=ACCENT_DK
         ).pack(side="right", padx=(0, 14))
+        if not is_primary:
+            self.app.link_button(
+                acts, "同步对话…", lambda: self.app.sync_chat_dialog(self.name), fg=ACCENT_DK
+            ).pack(side="right", padx=(0, 14))
         if data.get("kind") == "clone":
             self.app.link_button(
                 acts, "核对隔离", lambda: self.app.verify_lane(self.name), fg=ACCENT_DK
@@ -480,6 +484,35 @@ class LauncherApp:
                      "muted")
         except Exception as exc:  # noqa: BLE001
             self.log(f"[!!] 记住下载源失败：{exc}", "warn")
+
+    def no_inherit_row(self, parent, hint_on: str, hint_off: str, pady=(10, 0)):
+        """「不继承密钥和设置」勾选框 —— 新建版本 / 复制一套 DSH 两个对话框共用。
+
+        口径和 CLI 的 `--no-inherit` 完全一致（走 core.NO_INHERIT_HOME_ITEMS）：
+        不带 API key、匿名身份、DSH 设置、agent 预设；插件包、插件数据、对话、附件照旧。
+        默认**不勾** —— 也就是保持老行为，不点它就跟以前一模一样。
+        """
+        var = tk.BooleanVar(value=False)
+        tk.Checkbutton(
+            parent,
+            text="不继承密钥和设置（不带 API key、匿名身份、DSH 设置、agent 预设）",
+            variable=var, bg=BG, fg=TEXT, selectcolor=CARD,
+            activebackground=BG, activeforeground=TEXT, font=(FONT_UI, 9),
+            highlightthickness=0, cursor="hand2", anchor="w", justify="left",
+        ).pack(anchor="w", padx=18, pady=pady)
+        hint = tk.Label(parent, text=hint_off, bg=BG, fg=MUTED, font=(FONT_UI, 8),
+                        wraplength=470, justify="left")
+        hint.pack(anchor="w", padx=34)
+
+        def on_toggle(*_a) -> None:
+            try:
+                hint.configure(text=hint_on if var.get() else hint_off)
+            except tk.TclError:
+                pass
+
+        var.trace_add("write", on_toggle)
+        on_toggle()
+        return var, hint
 
     # ── 顶部 ────────────────────────────────────────────────────────────────
     def _build_header(self) -> None:
@@ -1535,7 +1568,7 @@ class LauncherApp:
         dlg.configure(bg=BG)
         dlg.transient(self.root)
         dlg.resizable(False, False)
-        w, h = 580, 380
+        w, h = 580, 452
         x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
         y = self.root.winfo_rooty() + 80
         dlg.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
@@ -1547,7 +1580,7 @@ class LauncherApp:
         tk.Label(
             dlg,
             text=(
-                "副本带走这套的全部状态：会话记录、设置、已装插件、API key。\n"
+                "副本带走这套的全部状态：会话记录、设置、已装插件、插件数据、API key。\n"
                 "副本有自己的安装树和 DSH_HOME —— 升级副本不会碰到原件，出问题删掉副本就行。\n"
                 "典型用法：复制主要版本 → 升级副本 → 点「核对隔离」→ 看插件还都在不在。"
             ),
@@ -1557,6 +1590,14 @@ class LauncherApp:
             wraplength=520,
             justify="left",
         ).pack(anchor="w", padx=20)
+
+        no_inherit_var, _ = self.no_inherit_row(
+            dlg,
+            hint_off="（默认＝整套复制。想要一个不带你的 key、也不带你设置的干净副本，就勾上）",
+            hint_on="（副本会跳过 API key、匿名身份、DSH 设置与 agent 预设；"
+                    "插件、插件数据、对话、附件照旧。启动后卡片会提示「补齐 API key…」，想补随时点）",
+            pady=(10, 0),
+        )
 
         form = tk.Frame(dlg, bg=BG)
         form.pack(fill="x", padx=20, pady=14)
@@ -1634,12 +1675,13 @@ class LauncherApp:
                 except ValueError:
                     messagebox.showwarning("复制", "端口必须是数字", parent=dlg)
                     return
+            # Tk 变量只在主线程读：Namespace 在这里一次拼好，worker 线程只管跑
+            ns = argparse.Namespace(source=lane, lane=new, port=port,
+                                    no_inherit=no_inherit_var.get())
             dlg.destroy()
             self.run_job(
                 f"复制 {lane} → {new}",
-                lambda: core.cmd_clone(
-                    core.load_config(), argparse.Namespace(source=lane, lane=new, port=port)
-                ),
+                lambda: core.cmd_clone(core.load_config(), ns),
             )
 
         ttk.Button(btns, text="开始复制", command=start).pack(side="right")
@@ -2159,13 +2201,119 @@ class LauncherApp:
         ttk.Button(btns, text="恢复选中的", command=do_restore).pack(side="left", padx=(8, 0))
         ttk.Button(btns, text="删除选中的", command=do_rm).pack(side="left", padx=(8, 0))
 
+    def sync_chat_dialog(self, lane: str) -> None:
+        """把主 DSH（主要版本）的**对话**同步进这条 lane —— 只搬对话与附件，配置一律不动。
+
+        为什么值得单独一个对话框：这是一个会**覆盖**东西的动作（同名会话里较旧的那份会被
+        源里较新的顶掉），所以先把"会动多少"摆出来（预演），再让他决定；还默认帮他先存一份
+        快照，同步错了能退回去。
+        """
+        cfg = core.load_config()
+        core.sync_lane_versions(cfg)
+        src = core.primary_lane(cfg)
+        dlg = tk.Toplevel(self.root)
+        dlg.title("同步对话")
+        dlg.configure(bg=BG)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        w, h = 620, 460
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + 70
+        dlg.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()
+
+        tk.Label(dlg, text=f"把主 DSH 的对话同步进「{lane}」", bg=BG, fg=TEXT,
+                 font=(FONT_UI, 13, "bold")).pack(anchor="w", padx=20, pady=(16, 4))
+        tk.Label(
+            dlg,
+            text=(
+                f"源：主要版本「{src or '（还没设主要版本）'}」　→　目标：「{lane}」\n"
+                "只搬对话：会话正文、会话列表用的投影记录、工作区登记、附件。\n"
+                "密钥 / 设置 / 插件 / 插件数据 / agent 预设一律不动。\n"
+                "规则：缺的补上；同名会话按修改时间较新的赢（覆盖了几条会打在日志里）。"
+            ),
+            bg=BG, fg=MUTED, font=(FONT_UI, 9), justify="left", wraplength=570,
+        ).pack(anchor="w", padx=20)
+
+        preview = tk.Label(dlg, text="正在算会同步什么…", bg=CARD, fg=GRAY, font=(FONT_UI, 9),
+                           justify="left", anchor="w", wraplength=560, height=6)
+        preview.pack(fill="x", padx=20, pady=(10, 0))
+
+        backup_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            dlg, text="同步前先给这条 lane 的对话存一份快照（同步错了能退回去）",
+            variable=backup_var, bg=BG, fg=TEXT, selectcolor=CARD,
+            activebackground=BG, activeforeground=TEXT, font=(FONT_UI, 9),
+            highlightthickness=0, cursor="hand2", anchor="w", justify="left",
+        ).pack(anchor="w", padx=20, pady=(10, 0))
+        if core.lane_runtime(cfg, lane):
+            tk.Label(dlg, text="这条 lane 正在运行：同步会先把它停掉（之后请手动「打开」）",
+                     bg=BG, fg=AMBER, font=(FONT_UI, 9)).pack(anchor="w", padx=20, pady=(6, 0))
+
+        def load_plan() -> None:
+            try:
+                plan = core.sync_chat_plan(core.load_config(), src, lane) if src else None
+                if plan is None:
+                    text, fg = "还没有主要版本 —— 先在别的卡片上点「★ 设为主要版本」", AMBER
+                elif plan["problems"]:
+                    text, fg = "\n".join(plan["problems"]), RED
+                else:
+                    files = plan["new_files"] + plan["over_files"]
+                    ws = plan["workspace"] or {}
+                    text = (
+                        f"会话：新增 {len(plan['sessions_new'])} 个 / 覆盖 {len(plan['sessions_over'])} 个"
+                        f"（按修改时间较新的赢）\n"
+                        f"文件：要复制 {files} 个 / {core.human_size(plan['bytes'])}"
+                        f"（跳过 {plan['skip_files']} 个一样新或更旧的）\n"
+                        f"工作区登记：新增工作区 {ws.get('new_workspaces', 0)} 个 / "
+                        f"补进会话 id {ws.get('new_sessions', 0)} 个"
+                    )
+                    fg = GRAY if files else MUTED
+                    if not files and not ws.get("changed"):
+                        text += "\n（已经是最新的，没有要同步的东西）"
+            except Exception as exc:  # noqa: BLE001
+                text, fg = f"算不出来：{type(exc).__name__}: {exc}", RED
+
+            def apply() -> None:
+                try:
+                    if dlg.winfo_exists():
+                        preview.configure(text=text, fg=fg)
+                except tk.TclError:
+                    pass
+
+            self.root.after(0, apply)
+
+        threading.Thread(target=load_plan, daemon=True).start()
+
+        btns = tk.Frame(dlg, bg=BG)
+        btns.pack(fill="x", padx=20, pady=(12, 16), side="bottom")
+
+        def start() -> None:
+            # Tk 变量只在主线程读
+            ns = argparse.Namespace(lane=lane, from_lane=None, dry_run=False,
+                                    backup=backup_var.get(), stop=True, yes=True)
+            dlg.destroy()
+            self.run_job(f"同步对话：{src} → {lane}",
+                         lambda: core.cmd_chat_sync(core.load_config(), ns))
+
+        def dry() -> None:
+            ns = argparse.Namespace(lane=lane, from_lane=None, dry_run=True,
+                                    backup=False, stop=False, yes=True)
+            dlg.destroy()
+            self.run_job(f"预演同步对话：{src} → {lane}",
+                         lambda: core.cmd_chat_sync(core.load_config(), ns))
+
+        self.button(btns, "开始同步", start, primary=True).pack(side="right")
+        self.button(btns, "取消", dlg.destroy).pack(side="right", padx=6)
+        self.button(btns, "先预演一次（不写文件）", dry).pack(side="left")
+
     def new_version_dialog(self) -> None:
         dlg = tk.Toplevel(self.root)
         dlg.title("新建版本")
         dlg.configure(bg=BG)
         dlg.transient(self.root)
         dlg.resizable(False, False)
-        w, h = 540, 580
+        w, h = 540, 660
         x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
         y = self.root.winfo_rooty() + 90
         dlg.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
@@ -2184,24 +2332,29 @@ class LauncherApp:
             justify="left",
         ).pack(anchor="w", padx=20)
 
-        # API key 继承说明：只在创建时复制一次
+        # API key 继承说明：只在创建时复制一次（新 lane 没有别的配置可继承）
         cfg_now = core.load_config()
         top_lane = core.primary_lane(cfg_now)
+        refs: dict = {}
         if top_lane:
             top_home = (cfg_now["lanes"].get(top_lane) or {}).get("home") or ""
             refs = core.read_credential_refs(top_home)
             if refs:
                 key_text = f"将从主要版本「{top_lane}」复制：{'、'.join(sorted(refs))}"
+                key_text_on = (f"不继承 —— 主要版本「{top_lane}」的 "
+                               f"{'、'.join(sorted(refs))} 不会带过来，首次启动时自己填")
                 key_bg, key_fg = "#EEF1FF", ACCENT_DK
             else:
                 key_text = f"主要版本「{top_lane}」的 HOME 里还没有 API key，这次复制不到东西"
+                key_text_on = f"不继承 —— 主要版本「{top_lane}」本来也没有 key，首次启动时自己填"
                 key_bg, key_fg = AMBER_BG, AMBER
         else:
             key_text = "还没有主要版本 —— 新 lane 首次启动时要自己填 API key"
+            key_text_on = "不继承 —— 首次启动时自己填"
             key_bg, key_fg = AMBER_BG, AMBER
         keybox = tk.Frame(dlg, bg=key_bg)
         keybox.pack(fill="x", padx=20, pady=(8, 0))
-        tk.Label(
+        key_label = tk.Label(
             keybox,
             text="API key：" + key_text,
             bg=key_bg,
@@ -2209,8 +2362,9 @@ class LauncherApp:
             font=(FONT_UI, 9),
             wraplength=460,
             justify="left",
-        ).pack(anchor="w", padx=10, pady=(7, 0))
-        tk.Label(
+        )
+        key_label.pack(anchor="w", padx=10, pady=(7, 0))
+        key_note = tk.Label(
             keybox,
             text="（只在创建时复制这一次；以后要换 key 就各自改各自的 HOME，互不影响）",
             bg=key_bg,
@@ -2218,7 +2372,35 @@ class LauncherApp:
             font=(FONT_UI, 8),
             wraplength=460,
             justify="left",
-        ).pack(anchor="w", padx=10, pady=(0, 7))
+        )
+        key_note.pack(anchor="w", padx=10, pady=(0, 7))
+
+        no_inherit_var, _ = self.no_inherit_row(
+            dlg,
+            hint_off="（默认＝照老规矩，把主要版本的 API key 复制这一次。新建本来也只继承这一项）",
+            hint_on="（勾上就什么都不继承 —— 新 lane 首启自己填 key，以后想补："
+                    "卡片上的「补齐 API key…」）",
+        )
+
+        def apply_key_text(*_a) -> None:
+            """勾了「不继承」就把上面那条「会复制 key」的说明同步改成「不会复制」。"""
+            on = no_inherit_var.get()
+            try:
+                if on:
+                    keybox.configure(bg=AMBER_BG)
+                    key_label.configure(text="API key：" + key_text_on, bg=AMBER_BG, fg=AMBER)
+                    key_note.configure(text="（这次不带任何密钥与设置；不影响它的插件与对话）",
+                                       bg=AMBER_BG, fg=MUTED)
+                else:
+                    keybox.configure(bg=key_bg)
+                    key_label.configure(text="API key：" + key_text, bg=key_bg, fg=key_fg)
+                    key_note.configure(
+                        text="（只在创建时复制这一次；以后要换 key 就各自改各自的 HOME，互不影响）",
+                        bg=key_bg, fg=MUTED)
+            except tk.TclError:
+                pass
+
+        no_inherit_var.trace_add("write", apply_key_text)
 
         reg_var, reg_remember = self.registry_row(dlg, cfg_now, pady=(12, 0))
 
@@ -2306,7 +2488,8 @@ class LauncherApp:
             port_txt = port_var.get().strip()
             port = int(port_txt) if port_txt.isdigit() else None
             args = argparse.Namespace(lane=lane, version=ver, port=port, force=True, follow=True,
-                                      registry=reg_var.get())
+                                      registry=reg_var.get(),
+                                      no_inherit=no_inherit_var.get())
             self._save_registry_choice(reg_var, reg_remember)
 
             def job() -> None:
@@ -2389,9 +2572,11 @@ _REQUIRED_ACTIONS = (
     "verify_lane",
     "market_dialog",
     "chat_dialog",
+    "sync_chat_dialog",
     "new_version_dialog",
     "registry_row",
     "_save_registry_choice",
+    "no_inherit_row",
     "adopt_install",
     "kill_instance",
     "open_url",

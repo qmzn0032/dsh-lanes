@@ -1395,6 +1395,32 @@ def print_inherit_result(res: dict) -> None:
         info(col(f"                  → {res['path']}", C.GRAY))
 
 
+# ======================= 「不继承密钥和设置」（--no-inherit） =======================
+#
+# 口径（2026-10-12 用户选的 B）：只不带**密钥与设置**；插件包、插件数据、对话、附件照旧带。
+# 副本仍然是"你这套环境的快照"，只是没有你的 key、匿名身份和个性化设置。
+# 想加减范围只改这一个清单 —— CLI 的 --no-inherit 和 GUI 的勾选框都走这里。
+NO_INHERIT_HOME_ITEMS = (
+    ".credentials.yaml",    # API key（连同 .bak）
+    ".anonymous-user-id",   # 匿名身份（跟 key 一起走）
+    "settings.yaml",        # DSH 设置（连同 .imported / .bak）
+    ".agent-presets",       # agent 预设 / 人格（属于设置）
+)
+
+
+def no_inherit_skipped(home) -> list[str]:
+    """这个 HOME 里**实际存在**、会被「不继承」跳过的条目（只用来打印说明，不参与判断）。"""
+    out: list[str] = []
+    try:
+        for entry in os.scandir(Path(home)):
+            if any(entry.name == item or entry.name.startswith(item)
+                   for item in NO_INHERIT_HOME_ITEMS):
+                out.append(entry.name)
+    except OSError:
+        return []
+    return sorted(out)
+
+
 def resolve_target(cfg: dict, target: str) -> str:
     """把用户给的 lane 名或版本号统一成 lane 名；必要时自动登记一条 lane。"""
     if target in cfg["lanes"]:
@@ -1583,16 +1609,21 @@ def cmd_create(cfg: dict, args) -> int:
     home = paths(cfg)["homes"] / lane
     home.mkdir(parents=True, exist_ok=True)
     port = args.port or (cfg["lanes"].get(lane, {}) or {}).get("port") or pick_port(cfg)
-    cfg["lanes"][lane] = {
+    no_inherit = bool(getattr(args, "no_inherit", False))
+    entry = {
         "version": version,
         "port": int(port),
         "home": str(home),
         "createdAt": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if no_inherit:
+        entry["noInherit"] = True
+    cfg["lanes"][lane] = entry
     save_config(cfg)
 
-    # 只在创建这一次复制 API key（之后各 lane 互不影响，要改自己改）
-    inherit = inherit_credentials(cfg, lane)
+    # 只在创建这一次复制 API key（之后各 lane 互不影响，要改自己改）。
+    # 新建本来也只继承这一项 —— 勾了「不继承」就什么都不继承，首启自己填。
+    inherit = None if no_inherit else inherit_credentials(cfg, lane)
 
     info("")
     ok(f"lane「{lane}」就绪")
@@ -1601,8 +1632,11 @@ def cmd_create(cfg: dict, args) -> int:
     info(f"      安装目录  : {vdir}")
     info(f"      DSH_HOME : {home}")
     info(f"      端口      : {port}")
-    print_inherit_result(inherit)
-    if not primary_lane(cfg):
+    if no_inherit:
+        info("      API key   : 未继承（你选了「不继承密钥和设置」；首次启动时自己填）")
+    else:
+        print_inherit_result(inherit)
+    if not no_inherit and not primary_lane(cfg):
         info("")
         warn("还没有设置主要版本。设一个之后，以后新建的版本会自动继承它的 API key：")
         info(col(f"      py {ME_NAME} primary {lane}", C.CYAN))
@@ -2200,10 +2234,10 @@ def _manifest_version(path) -> str | None:
         return None
 
 
-def copy_tree(src: Path, dst: Path, on_progress=None) -> dict:
+def copy_tree(src: Path, dst: Path, on_progress=None, skip_top=()) -> dict:
     """把 src 整棵复制到 dst。
 
-    规则（三条，缺一条就会静默出错）：
+    规则（四条，缺一条就会静默出错）：
       1. 普通文件/目录 → 复制，并保留时间戳；
       2. **junction / symlink 不复制内容、也不照抄链接**，只计数。
          照抄是错的：本机这些链接的目标都是绝对路径，照抄会让副本继续指向**原安装树**
@@ -2212,11 +2246,15 @@ def copy_tree(src: Path, dst: Path, on_progress=None) -> dict:
          正确做法是留空，由 DSH 启动时按"这次启动用的安装树"重建（`healProfilesModuleFallback`），
          事后用 `verify` 核对它到底指对了没有。
       3. 单条失败不中断整棵复制，但会记进 errors —— 有 error 的副本不可信，上层必须报错。
+      4. `skip_top`：名字前缀，**只作用在根目录那一层**（「不继承密钥和设置」用它跳过 HOME 顶层的
+         `.credentials.yaml` / `settings.yaml` 之类），被跳过的名字记在 `skipped` 里。
+         安装树那一路永远不传它 —— 树里也有 package.json、settings 之类同名文件，跳了就废。
     """
-    stats = {"files": 0, "dirs": 0, "bytes": 0, "links": 0, "errors": []}
-    stack = [(Path(src), Path(dst))]
+    stats = {"files": 0, "dirs": 0, "bytes": 0, "links": 0, "skipped": [], "errors": []}
+    skip_top = tuple(skip_top or ())
+    stack = [(Path(src), Path(dst), True)]
     while stack:
-        s, d = stack.pop()
+        s, d, is_root = stack.pop()
         try:
             d.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -2231,6 +2269,11 @@ def copy_tree(src: Path, dst: Path, on_progress=None) -> dict:
         for entry in entries:
             sp = Path(entry.path)
             dp = d / entry.name
+            if is_root and skip_top and any(
+                entry.name == item or entry.name.startswith(item) for item in skip_top
+            ):
+                stats["skipped"].append(entry.name)
+                continue
             if _is_reparse(sp):
                 stats["links"] += 1
                 continue
@@ -2240,7 +2283,7 @@ def copy_tree(src: Path, dst: Path, on_progress=None) -> dict:
                 stats["errors"].append((str(sp), str(exc)))
                 continue
             if is_dir:
-                stack.append((sp, dp))
+                stack.append((sp, dp, False))
                 continue
             try:
                 shutil.copyfile(sp, dp)
@@ -2510,7 +2553,11 @@ def cmd_clone(cfg: dict, args) -> int:
     为什么要"复制"而不是"新建"：新建出来的是空环境——没有你的会话、没有你装的插件、
     没有你的设置，根本测不出插件冲突。复制出来的是当前环境的快照，升级它就能回答
     "这批插件在新版本上还活着吗"，而原件一路不动（还能随时回退）。
+
+    `--no-inherit`：密钥与设置不进副本（见 NO_INHERIT_HOME_ITEMS），插件、插件数据、
+    对话、附件照旧复制。副本因此没有 API key —— 卡片上会出现「补齐 API key…」，想补随时点。
     """
+    no_inherit = bool(getattr(args, "no_inherit", False))
     try:
         src = resolve_target(cfg, args.source)
     except KeyError:
@@ -2537,6 +2584,11 @@ def cmd_clone(cfg: dict, args) -> int:
     info(col(f"── 复制 lane「{src}」→「{new}」 ──", C.BOLD))
     info(f"  源安装树    : {plan['src_install']}")
     info(f"  源 DSH_HOME : {plan['src_home']}")
+    if no_inherit:
+        will_skip = no_inherit_skipped(plan["src_home"])
+        info(col("  继承范围    : 不继承密钥和设置 —— 跳过 "
+                 + ("、".join(will_skip) if will_skip else "（源 HOME 里本来就没有这些）")
+                 + "；插件、插件数据、对话照旧", C.CYAN))
     info(f"  待复制      : 安装树 {human_size(plan['install_size'] or 0)}"
          f" + HOME {human_size(plan['home_size'] or 0)}"
          f" ≈ {human_size(need)}")
@@ -2567,7 +2619,9 @@ def cmd_clone(cfg: dict, args) -> int:
     write_lane_package_json(plan["install"], plan["src_version"], cfg.get("allow_scripts") or {})
 
     info(col("  [2/4] 复制 DSH_HOME（会话 / 设置 / 已装插件）…", C.CYAN))
-    st_home = copy_tree(plan["src_home"], plan["home"], on_progress=lambda s: progress(s, "HOME"))
+    st_home = copy_tree(plan["src_home"], plan["home"],
+                        on_progress=lambda s: progress(s, "HOME"),
+                        skip_top=NO_INHERIT_HOME_ITEMS if no_inherit else ())
 
     info(col("  [3/4] 重建 junction（安装树 + HOME，全部重定向到副本自己的路径）…", C.CYAN))
     pairs = [
@@ -2593,6 +2647,8 @@ def cmd_clone(cfg: dict, args) -> int:
         "clonedFrom": src,
         "createdAt": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if no_inherit:
+        cfg["lanes"][new]["noInherit"] = True
     save_config(cfg)
 
     errors = list(st_install["errors"]) + list(st_home["errors"])
@@ -2605,6 +2661,10 @@ def cmd_clone(cfg: dict, args) -> int:
     info(f"      端口      : {port}")
     info(f"      复制内容  : {st_install['files'] + st_home['files']} 个文件 / "
          f"{human_size(st_install['bytes'] + st_home['bytes'])}，用时 {elapsed:.1f}s")
+    if no_inherit:
+        info(f"      未继承    : 密钥与设置（按你的选择跳过"
+             + ("：" + "、".join(st_home["skipped"]) if st_home["skipped"] else "，源 HOME 里本来就没有")
+             + "）")
     info(f"      会话文件  : {count_sessions(plan['home'])} 个"
          f"（源 lane {count_sessions(plan['src_home'])} 个）")
     info(f"      宿主农场  : 重建链接 {rel['made']}/{rel['total']} 个"
@@ -2614,8 +2674,12 @@ def cmd_clone(cfg: dict, args) -> int:
         for path_text, reason in rel["errors"][:4]:
             info(col(f"      {path_text}：{reason}", C.GRAY))
         info(col(f"      核对： py {ME_NAME} verify {new}", C.CYAN))
-    refs = read_credential_refs(plan["home"])
-    info(f"      API key   : {'、'.join(sorted(refs)) if refs else '无（源 HOME 里就没有）'}")
+    if no_inherit:
+        info("      API key   : 未继承（勾了「不继承密钥和设置」；"
+             "要补就点卡片上的「补齐 API key…」，从主要版本复制一次）")
+    else:
+        refs = read_credential_refs(plan["home"])
+        info(f"      API key   : {'、'.join(sorted(refs)) if refs else '无（源 HOME 里就没有）'}")
 
     if errors:
         info("")
@@ -5865,6 +5929,362 @@ def cmd_chat_rm(cfg: dict, args) -> int:
     return 0
 
 
+# ======================= 与主 DSH 同步对话（chat-sync） =======================
+#
+# 只搬"对话"，**配置一律不动**。四样东西：
+#   sessions\<工作区>\<会话 id>\**                 会话正文（一代一个文件名，v0/v3/v4 都算）
+#   storages\session_projcache\sessions\<id>.json  会话列表用的投影记录（这一版是 per-record 布局）
+#   storages\workspace.json                        工作区登记（并集合并：工作区 + 会话 id）
+#   attachments\**                                 附件
+#
+# **明确不动**：.credentials.yaml（密钥）、.anonymous-user-id、settings.yaml（设置）、
+# profiles\（插件清单与插件包）、各插件自己的数据目录；也不动 archivedSessionIds /
+# pinnedSessionIds（"哪个会话被收起来 / 被钉住"属于视图状态，算配置那一侧）。
+#
+# 规则（用户 2026-10-13 定）：缺的补上；同名文件按**修改时间较新的赢**，并报告覆盖了几条。
+# 预演（--dry-run）与实做共用同一份判定，所以"说几条就几条"。
+#
+# 为什么不要 storages\session_projcache.json：那是 0.1.x 的单文件布局。本机这个文件停在
+# 2026-09-10 就没再动过（94.7 MB 死重），0.2.0-rc.2 用的是 session_projcache\ 目录
+# （包说明原话："durable per-session checkpoint records … the cached listing read"）。
+# 只搬目录不搬那个单文件，顺带避免把一个月前的旧列表塞进副本。
+
+CHAT_SYNC_TREES = (
+    Path("sessions"),
+    Path("attachments"),
+    Path("storages") / "session_projcache",
+)
+CACHE_TREE = Path("storages") / "session_projcache"
+WORKSPACE_STORE = Path("storages") / "workspace.json"
+
+
+def _file_table(root) -> dict:
+    """列出 root 下所有普通文件 → {posix 相对路径: (mtime, size)}。只读，不跟链接进去。
+
+    为什么不用 `os.walk` 的默认行为：Windows 上 **junction 的 `is_symlink()` 是 False**，
+    于是 os.walk 会把链接当普通目录走下去 —— 而 HOME 里的 `profiles\\node_modules` 就是一片
+    junction 农场，真跟进去会把宿主的包当成"对话文件"统计（甚至复制）。这里按 reparse 位整枝剪掉。
+    """
+    out: dict = {}
+    root = Path(root)
+    if not root.is_dir():
+        return out
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not _is_reparse(Path(dirpath) / d)]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if _is_reparse(path):
+                continue
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            out[path.relative_to(root).as_posix()] = (st.st_mtime, st.st_size)
+    return out
+
+
+def _session_keys(rels) -> set:
+    """会话文件路径 → 会话 id 集合（`<工作区>\\<会话 id>\\文件`）。只用来报"几个会话"。"""
+    keys = set()
+    for rel in rels:
+        parts = str(rel).split("/")
+        if len(parts) >= 3:
+            keys.add(parts[0] + "/" + parts[1])
+    return keys
+
+
+def _session_ids(rels) -> set:
+    """会话文件路径 → **会话 id**（uuid）集合。投影缓存的记录名就是 `<uuid>.json`，两边这样对上。"""
+    ids = set()
+    for rel in rels:
+        parts = str(rel).split("/")
+        if len(parts) >= 3:
+            ids.add(parts[1])
+    return ids
+
+
+def _load_store(path) -> dict | None:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def plan_workspace_merge(src_store, dst_store) -> dict:
+    """算清 `storages\\workspace.json` 并集合并的结果（**不写文件**）。
+
+    合并的是"能让同步进来的会话在界面上出现"的那几项：`global.workspaceIds`、
+    `global.initialized`、`tables.workspaces`（工作区记录 + 它的 `sessionIds`）。
+    目标里已有的工作区一律保留（并集），标题等字段以**目标**为准，不动它。
+    """
+    out = {"src": str(src_store), "dst": str(dst_store), "merged": None,
+           "new_workspaces": 0, "new_sessions": 0, "new_workspace_ids": 0,
+           "changed": False, "reason": ""}
+    src = _load_store(src_store)
+    if src is None:
+        out["reason"] = "源的工作区登记读不出来（没有或不是 JSON），这一项跳过"
+        return out
+    dst = _load_store(dst_store)
+    if dst is None:
+        out["merged"] = src
+        out["reason"] = "目标还没有工作区登记 → 整份照抄源"
+        out["changed"] = True
+        return out
+
+    merged = json.loads(json.dumps(dst))          # 深拷贝：不改目标原来那棵树
+    m_global = merged.setdefault("global", {})
+    m_ws = merged.setdefault("tables", {}).setdefault("workspaces", {})
+    s_global = src.get("global") or {}
+    s_ws = ((src.get("tables") or {}).get("workspaces")) or {}
+
+    for wid, rec in s_ws.items():
+        rec = rec or {}
+        if wid not in m_ws:
+            m_ws[wid] = rec                          # 目标没有这个工作区 → 整条搬过来
+            out["new_workspaces"] += 1
+            continue
+        have = list((m_ws[wid] or {}).get("sessionIds") or [])
+        for sid in list(rec.get("sessionIds") or []):
+            if sid not in have:
+                have.append(sid)
+                out["new_sessions"] += 1
+        (m_ws[wid] or {})["sessionIds"] = have
+
+    ids = list(m_global.get("workspaceIds") or [])
+    for wid in list(s_global.get("workspaceIds") or []):
+        if wid not in ids:
+            ids.append(wid)
+            out["new_workspace_ids"] += 1
+    m_global["workspaceIds"] = ids
+    if s_global.get("initialized") and not m_global.get("initialized"):
+        m_global["initialized"] = True
+        out["changed"] = True
+
+    out["merged"] = merged
+    out["changed"] = bool(out["new_workspaces"] or out["new_sessions"] or out["new_workspace_ids"]) \
+        or out["changed"]
+    return out
+
+
+def apply_workspace_merge(info: dict) -> dict:
+    """把并集结果写回（先留一份 `.bak`）。写不了不抛异常，交给调用方报出来。"""
+    dst = Path(info["dst"])
+    out = {"written": False, "path": str(dst), "error": None, "reason": info.get("reason") or ""}
+    merged = info.get("merged")
+    if merged is None:
+        out["error"] = out["reason"] or "没有可写的内容"
+        return out
+    try:
+        if dst.is_file():
+            try:
+                shutil.copy2(dst, dst.with_name(dst.name + ".bak"))
+            except OSError:
+                pass
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+        out["written"] = True
+    except OSError as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def sync_chat_plan(cfg: dict, src_lane: str, dst_lane: str) -> dict:
+    """算出这次同步会动什么。**只读**，不写任何文件（预演与实做共用这一份判定）。"""
+    src_home = lane_home(cfg, src_lane)
+    dst_home = lane_home(cfg, dst_lane)
+    plan = {
+        "src": src_lane, "dst": dst_lane, "src_home": src_home, "dst_home": dst_home,
+        "problems": [], "jobs": [], "trees": {}, "bytes": 0,
+        "new_files": 0, "over_files": 0, "skip_files": 0, "by_owner": 0,
+        "sessions_new": set(), "sessions_over": set(), "workspace": None,
+    }
+    if not src_home.is_dir():
+        plan["problems"].append(f"源 lane「{src_lane}」的 DSH_HOME 不存在：{src_home}")
+    if not dst_home.is_dir():
+        plan["problems"].append(f"目标 lane「{dst_lane}」的 DSH_HOME 不存在：{dst_home}")
+    if plan["problems"]:
+        return plan
+
+    # 投影缓存只跟"这次真的动过的会话"走：缓存记录里存的是按**源**那份会话文件算出来的检查点，
+    # 给一个"目标更新、刚被跳过没动"的会话塞源记录，两边就对不上了（记录说 5000 轮、文件 3000 轮）。
+    # 所以只有源文件确实要搬过去时，才更新它对应的缓存记录。
+    affected: set[str] = set()
+
+    for tree in CHAT_SYNC_TREES:
+        src_root = src_home / tree
+        if not src_root.is_dir():
+            continue
+        dst_root = dst_home / tree
+        has = _file_table(src_root)
+        cur = _file_table(dst_root)
+        item = {"total": len(has), "new": 0, "over": 0, "skip": 0, "by_owner": 0}
+        new_rels: list[str] = []
+        over_rels: list[str] = []
+        for rel, (mtime, size) in sorted(has.items()):
+            parts = rel.split("/")
+            if tree == CACHE_TREE and Path(rel).stem not in affected:
+                item["skip"] += 1
+                item["by_owner"] += 1
+                continue
+            existed = rel in cur
+            if existed and mtime <= cur[rel][0] + 1e-6:
+                item["skip"] += 1                      # 目标里那份一样新或更新 → 不碰
+                continue
+            if existed:
+                item["over"] += 1
+                over_rels.append(rel)
+                plan["over_files"] += 1
+            else:
+                item["new"] += 1
+                new_rels.append(rel)
+                plan["new_files"] += 1
+            plan["bytes"] += size
+            plan["jobs"].append({
+                "src": src_root / Path(*parts), "dst": dst_root / Path(*parts),
+                "size": size, "is_new": not existed, "rel": rel, "tree": tree.as_posix(),
+            })
+        plan["trees"][tree.as_posix()] = item
+        plan["skip_files"] += item["skip"]
+        plan["by_owner"] += item["by_owner"]
+        if tree == Path("sessions"):
+            # 会话层面报数：一个会话只要有**任何一个**文件被更新，就算"覆盖"而不是"新增"
+            # （同一个会话可能既有新代际文件、又有被覆盖的老文件，不这样区分两个桶会重复计数）
+            new_keys = _session_keys(new_rels)
+            over_keys = _session_keys(over_rels)
+            plan["sessions_new"] = new_keys - over_keys
+            plan["sessions_over"] = over_keys
+            affected |= _session_ids(new_rels + over_rels)
+
+    plan["workspace"] = plan_workspace_merge(src_home / WORKSPACE_STORE,
+                                             dst_home / WORKSPACE_STORE)
+    return plan
+
+
+def sync_chat_apply(plan: dict, on_progress=None) -> dict:
+    """照计划搬文件 + 合并工作区登记。保留 mtime（否则下次同步会把副本当成"更新"而永远跳过）。"""
+    res = {"copied": 0, "bytes": 0, "errors": [], "workspace": None}
+    for job in plan["jobs"]:
+        try:
+            Path(job["dst"]).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(job["src"], job["dst"])
+            try:
+                shutil.copystat(job["src"], job["dst"])
+            except OSError:
+                pass
+            res["copied"] += 1
+            res["bytes"] += job["size"]
+        except OSError as exc:
+            res["errors"].append((str(job["dst"]), str(exc)))
+        if on_progress and res["copied"] and res["copied"] % 200 == 0:
+            on_progress(res)
+    info_ws = plan.get("workspace")
+    if info_ws and info_ws.get("changed"):
+        res["workspace"] = apply_workspace_merge(info_ws)
+    return res
+
+
+def cmd_chat_sync(cfg: dict, args) -> int:
+    """把主 DSH（或 --from 指定的 lane）的**对话**同步到这条 lane；密钥与配置一律不动。"""
+    dst = args.lane
+    if dst not in cfg.get("lanes", {}):
+        fail(f"没有 lane「{dst}」")
+        return 1
+    src = getattr(args, "from_lane", None) or primary_lane(cfg)
+    if not src:
+        fail("没有主要版本，也没给 --from：不知道跟谁同步。先 primary <lane>，或写 --from <lane>")
+        return 1
+    if src not in cfg["lanes"]:
+        fail(f"没有源 lane「{src}」")
+        return 1
+    if src == dst:
+        fail("源和目标不能是同一条 lane")
+        return 1
+
+    dry = bool(getattr(args, "dry_run", False))
+    plan = sync_chat_plan(cfg, src, dst)
+    if plan["problems"]:
+        for item in plan["problems"]:
+            fail(item)
+        return 1
+
+    info(col(f"── 同步对话：{src} → {dst} ──", C.BOLD))
+    info(f"  源        {plan['src_home']}")
+    info(f"  目标      {plan['dst_home']}")
+    info("")
+    for name, item in plan["trees"].items():
+        note = (f"　（{item['by_owner']} 个属于这次没动的会话 → 不碰）"
+                if name == CACHE_TREE.as_posix() and item["by_owner"] else "")
+        info(f"  {name:<28} 源 {item['total']:>5} 个文件 → 新增 {item['new']:>4} 个"
+             f" / 覆盖 {item['over']:>4} 个 / 跳过 {item['skip']:>5} 个{note}")
+    ws = plan["workspace"] or {}
+    info(f"  工作区登记                   新增工作区 {ws.get('new_workspaces', 0)} 个"
+         f" / 补进会话 id {ws.get('new_sessions', 0)} 个"
+         + (f"（{ws['reason']}）" if ws.get("reason") else ""))
+    info("")
+    info(f"  会话      : 新增 {len(plan['sessions_new'])} 个 / 覆盖 {len(plan['sessions_over'])} 个"
+         f"（同名会话按修改时间较新的赢）")
+    info(f"  文件      : 要复制 {plan['new_files'] + plan['over_files']} 个 / "
+         f"{human_size(plan['bytes'])}（跳过 {plan['skip_files']} 个一样新或更旧的"
+         + (f"，其中 {plan['by_owner']} 个是没动过的会话的缓存记录" if plan["by_owner"] else "")
+         + "）")
+    info(f"  不动的    : 密钥 / 设置 / 插件 / 插件数据 / agent 预设（这次只搬对话与附件）")
+
+    if not plan["jobs"] and not ws.get("changed"):
+        info("")
+        ok("已经是最新的，没有要同步的东西")
+        return 0
+    if dry:
+        info("")
+        info(col("  这是预演（--dry-run）：一个文件都没写。", C.CYAN))
+        return 0
+
+    if lane_runtime(cfg, dst) and not getattr(args, "stop", False):
+        fail(f"lane「{dst}」正在运行：同步要写它的会话与工作区登记，先停它（或加 --stop 让启动器停）")
+        return 1
+    if lane_runtime(cfg, src):
+        warn(f"源 lane「{src}」正在运行：它此刻正在聊的那个会话可能只复制到半截（再同步一次会补上）")
+    if lane_runtime(cfg, dst):
+        info(col("  正在停止目标 lane…", C.GRAY))
+        cmd_stop(cfg, argparse.Namespace(target=[dst]))
+
+    if not getattr(args, "yes", False) and not _ask_yes(
+            f"确认把「{src}」的对话同步进「{dst}」？同名会话里较旧的那份会被覆盖"):
+        info("已取消")
+        return 0
+
+    pre = None
+    if getattr(args, "backup", False) and plan["jobs"]:
+        info(col("  先给目标的对话存一份快照（同步错了还能回来）…", C.GRAY))
+        pre = sessions_snapshot(cfg, dst, label="同步前", note=f"chat-sync 之前（源 {src}）")
+        info(col(f"      已存：{pre['name']}", C.GRAY))
+
+    info(col("  正在复制…", C.GRAY))
+    started = time.time()
+    res = sync_chat_apply(plan, on_progress=lambda r: info(
+        col(f"      …已复制 {r['copied']} 个文件 / {human_size(r['bytes'])}", C.GRAY)))
+    took = round(time.time() - started, 1)
+    info("")
+    ok(f"已复制 {res['copied']} 个文件 / {human_size(res['bytes'])}（{took} 秒）")
+    ws_res = res.get("workspace") or {}
+    if ws_res.get("written"):
+        info(f"  工作区登记  : 已更新 {ws_res['path']}（原文件已留 .bak）")
+    elif ws_res.get("error"):
+        warn(f"  工作区登记  : 没写成 —— {ws_res['error']}（会话文件已经过去，界面可能先看不到它们）")
+    if res["errors"]:
+        fail(f"有 {len(res['errors'])} 个文件没复制成功 —— 这次同步不完整：")
+        for path_text, reason in res["errors"][:5]:
+            info(col(f"      {path_text}：{reason}", C.GRAY))
+        return 1
+    me = ME_NAME
+    info("")
+    info(col(f"  打开目标看： py {me} open {dst}", C.CYAN))
+    info(col(f"  再同步一次： py {me} chat-sync {dst}  # 只补新的，不会重复搬", C.CYAN))
+    if pre:
+        info(col(f"  反悔      ： py {me} chat-restore {dst} {pre['name']} --yes", C.CYAN))
+    return 0
+
+
 def lane_delete_plan(cfg: dict, lane: str, sizes: bool = True) -> dict:
     """算清"删掉这条 lane"具体会动哪些文件，供 GUI / CLI 展示与确认。
 
@@ -6091,6 +6511,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_create.add_argument("--force", action="store_true", help="lane 已存在时覆盖其版本")
     p_create.add_argument("--no-follow", dest="follow", action="store_false",
                           help="安装时不实时跟随日志")
+    p_create.add_argument("--no-inherit", dest="no_inherit", action="store_true",
+                          help="不继承主要版本的 API key（新建本来也只继承这一项；首启自己填）")
     p_create.add_argument("--registry", metavar="auto|official|mirror|URL",
                           help="从哪个 npm 源查版本并下载：auto（默认，先官方再镜像）/ "
                                "official / mirror / 一个地址。缺依赖会自动换另一个源重试")
@@ -6165,6 +6587,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_clone.add_argument("source", help="源 lane 名或版本号（建议填主要版本）")
     p_clone.add_argument("lane", help="新 lane 名，例如 test-next")
     p_clone.add_argument("--port", type=int, help="指定端口（默认自动挑空闲端口）")
+    p_clone.add_argument("--no-inherit", dest="no_inherit", action="store_true",
+                         help="不继承密钥和设置：副本不带 API key / 匿名身份 / DSH 设置 / agent 预设，"
+                              "插件、插件数据、对话、附件照旧复制")
 
     p_upgrade = sub.add_parser(
         "upgrade",
@@ -6294,6 +6719,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat_rm.add_argument("name")
     p_chat_rm.add_argument("--yes", action="store_true", help="跳过确认（GUI / 脚本用）")
 
+    p_chat_sync = sub.add_parser(
+        "chat-sync",
+        help="把主 DSH（或 --from 的 lane）的对话同步到这条 lane：只搬对话与附件，"
+             "密钥 / 设置 / 插件一律不动",
+    )
+    p_chat_sync.add_argument("lane", help="目标 lane（同步进这一条）")
+    p_chat_sync.add_argument("--from", dest="from_lane", metavar="LANE",
+                             help="源 lane（默认＝主要版本）")
+    p_chat_sync.add_argument("--dry-run", dest="dry_run", action="store_true",
+                             help="只算出会同步什么，一个文件都不写")
+    p_chat_sync.add_argument("--backup", action="store_true",
+                             help="同步前先给目标的对话存一份快照（chat-backup 那一套）")
+    p_chat_sync.add_argument("--stop", action="store_true",
+                             help="目标正在运行就先停掉（默认拒绝在运行时同步）")
+    p_chat_sync.add_argument("--yes", action="store_true", help="跳过确认（GUI / 脚本用）")
+
     return parser
 
 
@@ -6354,6 +6795,7 @@ def main() -> int:
         "chat-list": cmd_chat_list,
         "chat-restore": cmd_chat_restore,
         "chat-rm": cmd_chat_rm,
+        "chat-sync": cmd_chat_sync,
     }
     try:
         return handlers[args.command](cfg, args)

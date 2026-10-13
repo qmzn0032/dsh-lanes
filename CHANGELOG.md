@@ -5,6 +5,64 @@ exe 不进仓库（`.gitignore` 排除了 `dist/`），要分享请把 `dist\*-o
 
 ---
 
+## v0.2.2 — 2026-10-13
+
+### 新增：新建 / 复制可以选择「不继承密钥和设置」（`--no-inherit`）
+
+**为什么做这个**：以前 `clone` 是**整套**搬走 —— 连 API key、匿名身份、DSH 设置、agent 预设
+一起带进副本。可有时候要的恰恰相反：一个"没有你的凭据、没有你的设置"的干净环境
+（比如把副本当成另一台机器来验证首次启动流程）。所以加一个开关，默认**不勾**（老行为一字不变）。
+
+勾上（或加 `--no-inherit`）之后：
+
+| 照旧带 | 不带 |
+| --- | --- |
+| 安装树、对话与附件（`sessions\`、`attachments\`）、已装插件（`profiles\` 连同 `node_modules`）、插件自己的数据（如语音模型） | `.credentials.yaml`（API key）、`.anonymous-user-id`（匿名身份）、`settings.yaml*`（DSH 设置）、`.agent-presets\`（agent 预设 / 人格） |
+
+- **CLI**：`clone` 与 `create` 新增 `--no-inherit`。
+- **GUI**：「复制这套 DSH」「新建版本」两个对话框里各有一个勾选框；新建那个勾上后，
+  上面那条"将从主要版本复制 key"的说明会**同步改写**成"不会复制"，不会一边说复制一边不复制。
+- 跳过范围只有**一个出处**：`dsh_lanes.py` 的 `NO_INHERIT_HOME_ITEMS`，GUI 与 CLI 共用它。
+- `copy_tree()` 新增 `skip_top`，**只匹配根目录那一层**的名字：`profiles\web\settings.yaml`
+  这类嵌套同名文件不会被误伤（实测验证过）。
+- 跳过的名字会打印出来（`未继承 : …`），lane 登记里记 `noInherit: true`。
+- 副本因此没有 API key —— 卡片上会出现「补齐 API key…」，想补随时点。
+
+**遗留**：`adopt`（接管已有安装）不加这个开关 —— 它的语义是"沿用现状"，不存在继承这一说。
+
+### 新增：与主 DSH 同步对话（`chat-sync`）
+
+**为什么做这个**：副本是某个时刻的快照，你在主 DSH 里继续聊出来的新对话，副本里看不见；
+而"把主那套重新复制一遍"会连密钥、设置、插件一起灌回来。所以要一个**只搬对话**的动作。
+
+```
+py dsh_lanes.py chat-sync <目标 lane> [--from LANE] [--dry-run] [--backup] [--stop] [--yes]
+```
+
+| 搬 | 不搬 |
+| --- | --- |
+| `sessions\**`（会话正文）、`attachments\**`（附件）、`storages\session_projcache\**`（会话列表用的投影记录）、`storages\workspace.json`（工作区登记，并集合并） | `.credentials.yaml`、`.anonymous-user-id`、`settings.yaml*`、`profiles\`（插件与插件包）、各插件数据、`archivedSessionIds` / `pinnedSessionIds` |
+
+三条实现上的关键判断：
+
+1. **同名按 mtime 较新的赢**（用户 2026-10-13 定的规则），覆盖几条会打出来；复制时用 `copystat`
+   保留 mtime —— 不保留的话副本那份看起来永远比源新，下次同步就再也不动了。
+2. **投影缓存只跟"这次真动过的会话"走**。`session_projcache\sessions\<id>.json` 里存的是按**源**
+   那份会话文件算出来的检查点；如果只按 mtime 独立比，就会给一个"目标更新、刚被跳过没动"的会话
+   塞进源记录（记录说 5000 轮、文件只有 3000 轮）。实测这一步把真实数据的搬运量从 201 个文件 /
+   129 MB 收敛到 84 个 / 63.6 MB。
+3. **不要 `storages\session_projcache.json`**：那是 0.1.x 的单文件布局。本机这个文件停在
+   2026-09-10 就没再动过（94.7 MB 死重），0.2.0-rc.2 用的是 `session_projcache\` 目录
+   （per-record 布局，包说明原话："durable per-session checkpoint records … the cached listing read"）。
+
+- **CLI**：新增 `chat-sync`（`--dry-run` 预演、`--backup` 先存快照、`--stop` 允许替你停目标）。
+- **GUI**：非主要版本的卡片上多一个「同步对话…」：先算账（新增/覆盖几个会话、要搬多少），
+  勾着"先存快照"默认开启，可以「先预演一次」再「开始同步」。
+- 安全线：目标是主要版本不给同步；目标正在运行时**拒绝**（要 `--stop`）；写 `workspace.json`
+  之前留 `.bak`。
+
+---
+
 ## v0.2.1 — 2026-10-01
 
 ### 修复：接管型 lane 的版本号不再「停在登记那一刻」

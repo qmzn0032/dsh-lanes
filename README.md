@@ -24,10 +24,11 @@
 | **看见"别的"实例** | `instances` | 列出**不是本启动器启动的** DSH 实例 + 本机所有安装树（npm 全局 / npx 缓存 / lane） |
 | **接管在用的那套** | `adopt <lane>` | 把本机已有的安装注册成 lane，沿用它的 `DSH_HOME`，之后从这个窗口打开/停止它 |
 | **标记主要版本** | `primary <lane>` | 常用版本置顶；新建 lane 时自动继承它的 API key |
-| **复制一整套** | `clone <源> <新>` | 安装树 + `DSH_HOME`（会话、设置、凭据、已装插件）整套复制成副本，动副本不碰原件 |
+| **复制一整套** | `clone <源> <新>` | 安装树 + `DSH_HOME`（会话、设置、凭据、已装插件）整套复制成副本，动副本不碰原件；`--no-inherit` 则不带密钥与设置 |
 | **升到指定版本** | `upgrade <lane> <版本>` | 就地升级 + 核对 + 启动冒烟，起不来自动退回；`--rollback` 回上一版 |
 | 核对隔离 | `verify <lane>` | 逐条比对链接、版本、pnpm 账本、本地依赖，并体检 profile 补丁层 |
 | 备份对话 | `chat-backup` / `chat-restore` | 会话整棵备份（逐文件指纹）+ 恢复（先校验快照、再另存现状） |
+| **与主 DSH 同步对话** | `chat-sync <lane>` | 把主 DSH（主要版本）的对话搬进这条 lane：只动对话与附件，密钥 / 设置 / 插件一律不动 |
 | 删除一套 | `delete <lane>` | 登记 + 运行态 + 安装树 + `DSH_HOME`；主要版本要手打名称二次确认 |
 
 `lane` ＝ 一条「版本通道」的名字，例如 `main` / `next` / `last`。
@@ -122,7 +123,7 @@ exe 没签名，首次运行 Windows SmartScreen 可能拦一下：点「更多�
 ```
 py dsh_lanes.py doctor                    环境自检
 py dsh_lanes.py versions [--all] [--registry auto|official|mirror]
-py dsh_lanes.py create <lane> <ver> [--port N] [--force] [--registry auto|official|mirror]
+py dsh_lanes.py create <lane> <ver> [--port N] [--force] [--no-inherit] [--registry auto|official|mirror]
 py dsh_lanes.py open <lane|ver> [--port N] [--cwd DIR] [--no-browser] [--detach] [--timeout N]
 py dsh_lanes.py list
 py dsh_lanes.py instances                 列出所有 DSH 实例（含不是本启动器启动的）
@@ -131,7 +132,7 @@ py dsh_lanes.py remove <lane> [--force]   只注销登记，不动安装树与 H
 py dsh_lanes.py primary [lane] [--clear]  ★ 主要版本：新建 lane 继承它的 API key
 py dsh_lanes.py sync-key [lane ...]       把主要版本的 API key 补到已有 lane
 py dsh_lanes.py delete <lane> [--stop] [--keep-home] [--keep-install] [--home-too] [--yes]
-py dsh_lanes.py clone <源 lane> <新 lane> [--port N]
+py dsh_lanes.py clone <源 lane> <新 lane> [--port N] [--no-inherit]
 py dsh_lanes.py upgrade <lane> <版本|tag> [--stop] [--dry-run] [--no-boot-check]
                                           [--registry auto|official|mirror]
 py dsh_lanes.py upgrade <lane> --rollback
@@ -142,6 +143,8 @@ py dsh_lanes.py market-off <lane> [--no-boot-check] / market-on <lane>
 py dsh_lanes.py market-update <lane> [--version V] [--anyway] [--no-boot-check] / market-rollback <lane>
 py dsh_lanes.py chat-backup <lane> [--name 后缀] / chat-list <lane>
 py dsh_lanes.py chat-restore <lane> [名称] [--stop] [--yes] [--force] / chat-rm <lane> <名称> [--yes]
+py dsh_lanes.py chat-sync <lane> [--from LANE] [--dry-run] [--backup] [--stop] [--yes]
+                                          把主 DSH 的对话同步进来（只搬对话，配置不动）
 py dsh_lanes.py stop [lane ...]           缺省停全部
 py dsh_lanes.py logs <lane> [--lines N]
 py selftest.py [lane ...]                 全链路复检：open → 认证握手 → 重复 open → stop
@@ -176,6 +179,47 @@ py selftest.py [lane ...]                 全链路复检：open → 认证握�
 
 命令行临时改一次：`py dsh_lanes.py upgrade next 0.2.0-rc.1 --registry mirror`。
 
+### 不继承密钥和设置：`--no-inherit`
+
+新建版本、复制一套都支持。默认是**整套继承**（老行为，不勾就不变）；勾上（或加 `--no-inherit`）之后：
+
+| 照旧带 | 不带 |
+| --- | --- |
+| 安装树、对话与附件（`sessions\`、`attachments\`）、已装插件（`profiles\`）、插件自己的数据（语音模型、插件设置…） | `.credentials.yaml`（API key）、`.anonymous-user-id`（匿名身份）、`settings.yaml*`（DSH 设置）、`.agent-presets\`（agent 预设 / 人格） |
+
+- **新建版本**本来只继承 API key 这一项，所以它的 `--no-inherit` 就等于"不复制 key"，首次启动自己填。
+- **复制**的跳过范围写在 `dsh_lanes.py` 的 `NO_INHERIT_HOME_ITEMS` 一个清单里 —— GUI 勾选框和
+  CLI 参数走的是同一份清单，要加减只改那里。
+- 跳过了哪些会打在输出里（`未继承 : …`），lane 登记里记 `noInherit: true`。
+- 副本因此**没有 API key**，卡片上会出现「补齐 API key…」，想补随时点（从主要版本复制一次）。
+- 只跳 **HOME 顶层**的名字：`profiles\web\settings.yaml` 这种嵌套同名文件不会被误伤。
+
+### 与主 DSH 同步对话：`chat-sync`
+
+用途：副本（或任何一条 lane）里想看主 DSH 的新对话，又**不想**把主那边的密钥 / 设置 / 插件
+重新灌进来。
+
+```
+py dsh_lanes.py chat-sync <目标 lane>              # 源＝主要版本
+py dsh_lanes.py chat-sync <目标 lane> --dry-run    # 只算账，一个文件都不写
+py dsh_lanes.py chat-sync <目标 lane> --from next  # 换源
+```
+
+| 搬 | 不搬 |
+| --- | --- |
+| `sessions\**`（会话正文）、`attachments\**`（附件）、`storages\session_projcache\**`（会话列表用的投影记录）、`storages\workspace.json`（工作区登记，并集合并） | `.credentials.yaml`、`.anonymous-user-id`、`settings.yaml*`、`profiles\`（插件与插件包）、各插件数据、`archivedSessionIds` / `pinnedSessionIds` |
+
+三条规矩：
+
+1. **缺的补上；同名按修改时间较新的赢**，覆盖了几条会打在屏幕上。
+2. **投影缓存只跟"这次真动过的会话"走。** 那份记录里存着按**源**的会话文件算出来的检查点，
+   给一个"目标更新、被跳过没动"的会话塞源记录，两边就对不上（记录说 5000 轮、文件 3000 轮）。
+3. 复制保留 mtime —— 否则副本那份看起来"永远比源新"，下次同步就再也不动了。
+
+安全默认：目标是主要版本时不给同步（自己跟自己没意义）；目标正在运行时**拒绝**（`--stop` 才替你停）；
+`--backup` 先给目标存一份对话快照，同步错了能 `chat-restore` 回去；`storages\workspace.json`
+写之前留 `.bak`。GUI 上就是卡片上的「同步对话…」（主要版本的卡片上没有这个按钮）。
+
 ---
 
 ## 8. 已知限制 / 有意不做
@@ -205,6 +249,8 @@ py selftest.py [lane ...]                 全链路复检：open → 认证握�
 | 用 exe 起不来又没报错 | `--windowed` 的 GUI exe 没有控制台：改用 `dsh-lanes.exe doctor`（同目录）看报错 |
 | 新建 / 升级报 npm `ETARGET` / `notarget` | 那个源还没同步到这一版：加 `--registry official`（或 `mirror`）换一个源再试，或等几小时。工具默认就会自动换另一个源重试一次 |
 | 卡片上的版本和你自己 `npm i -g` 升过的不一致 | 不用管：每轮刷新都会从安装树读真实版本并更正台账（接管型 lane 的树在启动器之外，只读不改） |
+| 新建 / 复制的 lane 一启动就让你填 API key | 建它时勾了「不继承密钥和设置」（`--no-inherit`）：点卡片上的「补齐 API key…」从主要版本补一次，或自己在界面里填 |
+| 副本里看不到主 DSH 的新对话 | `py dsh_lanes.py chat-sync <副本> --dry-run` 先看会搬什么，不加 `--dry-run` 就同步（只搬对话，配置不动） |
 
 ---
 
@@ -255,7 +301,14 @@ build_exe.bat                      :: 双击也行
 
 ## 11. 更新记录
 
-见 [CHANGELOG.md](CHANGELOG.md)。当前版本 **v0.2.1**（2026-10-01）：
+见 [CHANGELOG.md](CHANGELOG.md)。当前版本 **v0.2.2**（2026-10-13）：
+
+- 新建 / 复制可以选择「不继承密钥和设置」（`--no-inherit`）—— 不带 API key、匿名身份、
+  DSH 设置与 agent 预设，插件、插件数据、对话照旧复制；
+- 新增「与主 DSH 同步对话」（`chat-sync <lane>`）—— 只搬对话、附件、会话列表记录与工作区登记，
+  密钥 / 设置 / 插件一律不动；缺的补上、同名按修改时间较新的赢。
+
+上一版 **v0.2.1**（2026-10-01）：
 
 - 台账自愈：接管型 lane（npm 全局那份）的版本号不再停在登记那一刻，每轮刷新按安装树更正；
 - 新建 / 升级可以自己选下载源（官方源 / 镜像源），查版本与下载保证同源，缺包自动换源重试一次；
