@@ -312,9 +312,36 @@ build_exe.bat                      :: 双击也行
 
 ---
 
-## 11. 更新记录
+## 11. 界面：「大肥鱼化」
 
-见 [CHANGELOG.md](CHANGELOG.md)。当前版本 **v0.2.3**（2026-10-24）：
+v0.3.0 把界面换成一套自绘外观（品牌蓝 `#4D6BFE` + 官方鲸鱼图标），**功能一行没减**：
+
+- `ui_kit.py`（新增）：`RoundedButton` / `RoundedCard` / `Pill` / `Chip` / `MiniScrollbar`，
+  纯 `tkinter` + `math`，零第三方依赖；API 向 `tk.Button` 靠拢，所以老的调用点不用改；
+- 卡片改成圆角 + 悬停 + 左侧状态色条，版本号与运行状态改成芯片 / 胶囊；
+- 日志面板重做：时间戳列、级别字形、小节留白、空状态、「自动滚动已暂停」提示，上限 4000 行；
+- 顶栏三行压两行，dist-tag 改芯片，窄窗口自动少显示几个；
+- `assets/app.ico`：官方 favicon 光栅化出来的鲸鱼，七档尺寸、透明底，窗口标题栏与 exe 共用；
+- `tools/dsh_stub.cs` + `build_stub.bat`：46 KB 的 GUI 子系统 C# 壳，去找本机的 `pythonw`
+  再拉起 `dsh_lanes_gui.py` —— 比 PyInstaller 文件夹版（2.3 MB + `_internal\` 22.3 MB）
+  小两个数量级，而且改完 `.py` 不用重新打包。
+
+细节、以及顺手修掉的四个坑（黑窗口 / 受限令牌 / 日志占用 / 端口被占）见
+[docs/界面美化.md](docs/界面美化.md)。单独看控件：`py ui_kit_demo.py`。
+
+---
+
+## 12. 更新记录
+
+见 [CHANGELOG.md](CHANGELOG.md)。当前版本 **v0.3.0**（2026-10-25）：
+
+- **界面重做**：自绘控件库 `ui_kit.py`、圆角卡片 + 状态色条、日志面板重做、顶栏重排；
+- **图标**：`assets/app.ico` 换成官方鲸鱼（七档尺寸、透明底、品牌蓝）；
+- **46 KB 轻量壳**：`tools/dsh_stub.cs`，GUI 子系统、不弹黑窗口；
+- **顺手修的四件事**：`subprocess` 统一 `CREATE_NO_WINDOW`；受限令牌（沙箱）在界面上直接点名；
+  日志文件被占用时降级而不拦死「打开 lane」；端口被占但读不到 PID 时直接接管。
+
+上一版 **v0.2.3**（2026-10-24）：
 
 - 「默认路径那份」也能升级了：GUI 的升级对话框里多了「在终端里升级」，
   CLI 是新旗标 `upgrade <lane> <版本> --in-terminal`；工具只把
@@ -338,6 +365,6 @@ build_exe.bat                      :: 双击也行
 
 ---
 
-## 12. 许可
+## 13. 许可
 
 MIT，见 [LICENSE](LICENSE)。

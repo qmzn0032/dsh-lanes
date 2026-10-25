@@ -28,6 +28,7 @@ import tkinter as tk
 import traceback
 import webbrowser
 from pathlib import Path
+from tkinter import font as tkfont
 from tkinter import messagebox, simpledialog, ttk
 
 HERE = Path(__file__).resolve().parent
@@ -35,6 +36,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import dsh_lanes as core  # noqa: E402
+import ui_kit as ui  # noqa: E402  ← 自绘控件库（圆角按钮 / 胶囊 / 芯片）
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 LANE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
@@ -58,6 +60,21 @@ AMBER_BG = "#FEF3E2"
 
 FONT_UI = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
+
+# ── 日志行的级别样式 ────────────────────────────────────────────────────────
+# 级别 → (前缀字形, 标记颜色, 正文颜色, 正文是否加粗)
+# 字形只用 Consolas 确实收录的那几个（实测：✓ ✗ ▸ · 都在），不靠系统字体回退，
+# 否则缺字形时会掉成方框，比不加还难看。
+_LOG_STYLE = {
+    "ok": ("✓", ui.GREEN, TEXT, False),
+    "err": ("×", ui.RED, ui.RED, False),
+    "warn": ("!", ui.AMBER, ui.AMBER, False),
+    "head": ("▸", ui.ACCENT, ui.ACCENT_DK, True),
+    "muted": ("·", ui.SUBTLE, MUTED, False),
+    "": ("·", ui.SUBTLE, TEXT, False),
+}
+_LOG_MARKERS = (("[OK]", "ok"), ("[XX]", "err"), ("[!!]", "warn"))
+_LOG_GLYPH_W = "✓ "        # 用来量标记列宽度（等宽字，所有字形同宽）
 
 
 def enable_dpi_awareness() -> None:
@@ -105,11 +122,27 @@ def short_url(url: str, keep: int = 14) -> str:
     return f"{head}{tok[:keep]}…{tok[-4:]}"
 
 
-class LaneCard(tk.Frame):
+def _set_wrap(label: tk.Label, width: int, min_w: int) -> None:
+    """把标签的 wraplength 跟着容器宽度调。
+
+    先比较再改：无脑 configure(wraplength=...) 每次都会让标签重新排版，
+    而标签变高又会触发父容器的 <Configure>，窄窗口下会来回抖。
+    """
+    try:
+        want = max(min_w, int(width) - 6)
+        if abs(int(label.cget("wraplength")) - want) > 10:
+            label.configure(wraplength=want)
+    except tk.TclError:
+        pass
+
+
+class LaneCard(ui.RoundedCard):
     """一条 lane 的卡片：名称 / 版本 / 端口 / 状态 + 操作。
 
     主要版本（primary）会被置顶，卡片加粗蓝边、标题旁挂 ★ 徽章，
     底部那行说明文字也换成主要版本的特别标注。
+
+    v2：改成 RoundedCard（Canvas 画圆角底），内容挂到 self.inner。
     """
 
     def __init__(
@@ -126,8 +159,14 @@ class LaneCard(tk.Frame):
         super().__init__(
             master,
             bg=CARD,
-            highlightbackground=(ACCENT if is_primary else BORDER),
-            highlightthickness=(2 if is_primary else 1),
+            border=(ACCENT if is_primary else BORDER),
+            border_hover=(ACCENT if is_primary else ui.BORDER_HOVER),
+            border_width=(2 if is_primary else 1),
+            radius=10,
+            padx=13,
+            pady=10,
+            # 左边一根状态色条：扫一眼就知道哪条在跑（没在跑就不画，绿色才代表"活着"）
+            rail=(ui.GREEN if runtime else None),
         )
         self.app = app
         self.name = name
@@ -135,8 +174,8 @@ class LaneCard(tk.Frame):
         self.runtime = runtime
         self.is_primary = is_primary
 
-        pad = tk.Frame(self, bg=CARD)
-        pad.pack(fill="x", padx=14, pady=11)
+        pad = tk.Frame(self.inner, bg=CARD)
+        pad.pack(fill="x")
 
         # ── 第一行：主体信息 + 主操作
         # 先放右侧定宽部件（按钮、徽章），最后放会撑开的左侧块，
@@ -146,22 +185,18 @@ class LaneCard(tk.Frame):
 
         btns = tk.Frame(head, bg=CARD)
         btns.pack(side="right")
-        self.app.button(btns, "打开", lambda: self.app.open_lane(self.name), primary=True).pack(
-            side="left", padx=3
-        )
-        self.app.button(btns, "停止", lambda: self.app.stop_lane(self.name), danger=True).pack(
-            side="left", padx=3
-        )
-        self.app.button(btns, "日志", lambda: self.app.show_lane_log(self.name)).pack(side="left", padx=3)
+        self.app.button(btns, "打开", lambda: self.app.open_lane(self.name),
+                        primary=True, size="sm").pack(side="left", padx=3)
+        self.app.button(btns, "停止", lambda: self.app.stop_lane(self.name),
+                        danger=True, size="sm").pack(side="left", padx=3)
+        self.app.button(btns, "日志", lambda: self.app.show_lane_log(self.name),
+                        size="sm").pack(side="left", padx=3)
 
-        badge = tk.Label(
+        badge = ui.Pill(
             head,
-            text=("● 运行中" if runtime else "○ 已停止"),
-            bg=(GREEN_BG if runtime else GRAY_BG),
-            fg=(GREEN if runtime else GRAY),
-            font=(FONT_UI, 9, "bold"),
-            padx=10,
-            pady=3,
+            "运行中" if runtime else "已停止",
+            "on" if runtime else "off",
+            bg=CARD,
         )
         badge.pack(side="right", padx=(0, 12))
 
@@ -170,20 +205,10 @@ class LaneCard(tk.Frame):
 
         title = tk.Frame(left, bg=CARD)
         title.pack(anchor="w")
-        tk.Label(title, text=name, bg=CARD, fg=TEXT, font=(FONT_UI, 12, "bold")).pack(side="left")
-        tk.Label(
-            title, text=f"  {data.get('version', '?')}", bg=CARD, fg=MUTED, font=(FONT_UI, 10)
-        ).pack(side="left")
+        tk.Label(title, text=name, bg=CARD, fg=TEXT, font=(FONT_UI, 13, "bold")).pack(side="left")
+        ui.Chip(title, str(data.get("version", "?")), "ver", bg=CARD).pack(side="left", padx=(7, 0))
         if is_primary:
-            tk.Label(
-                title,
-                text=" ★ 主要版本 ",
-                bg=ACCENT,
-                fg="#FFFFFF",
-                font=(FONT_UI, 8, "bold"),
-                padx=2,
-                pady=1,
-            ).pack(side="left", padx=(6, 0))
+            ui.Chip(title, "★ 主要版本", "primary", bg=CARD).pack(side="left", padx=(6, 0))
 
         meta = f"端口 {data.get('port', '-')}"
         if runtime:
@@ -209,7 +234,7 @@ class LaneCard(tk.Frame):
             link.bind("<Leave>", lambda _e: link.configure(fg=ACCENT, text=short_url(url)))
 
         # ── 第二行：次要操作（设为主要版本 / 删除这套 DSH）+ 主要版本说明
-        tk.Frame(pad, bg=BORDER, height=1).pack(fill="x", pady=(9, 7))
+        tk.Frame(pad, bg="#EDEFF2", height=1).pack(fill="x", pady=(7, 5))
         foot = tk.Frame(pad, bg=CARD)
         foot.pack(fill="x")
 
@@ -222,40 +247,9 @@ class LaneCard(tk.Frame):
                 my_refs = {}
         missing = [] if is_primary else sorted(set(primary_refs or {}) - set(my_refs))
 
-        acts = tk.Frame(foot, bg=CARD)
-        acts.pack(side="right")
-        self.app.link_button(
-            acts, "删除这套 DSH", lambda: self.app.delete_lane(self.name), fg=RED
-        ).pack(side="right")
-        self.app.link_button(
-            acts, "复制…", lambda: self.app.clone_lane(self.name), fg=ACCENT_DK
-        ).pack(side="right", padx=(0, 14))
-        self.app.link_button(
-            acts, "升级版本…", lambda: self.app.upgrade_dialog(self.name), fg=ACCENT_DK
-        ).pack(side="right", padx=(0, 14))
-        self.app.link_button(
-            acts, "插件市场…", lambda: self.app.market_dialog(self.name), fg=ACCENT_DK
-        ).pack(side="right", padx=(0, 14))
-        self.app.link_button(
-            acts, "备份对话…", lambda: self.app.chat_dialog(self.name), fg=ACCENT_DK
-        ).pack(side="right", padx=(0, 14))
-        if not is_primary:
-            self.app.link_button(
-                acts, "同步对话…", lambda: self.app.sync_chat_dialog(self.name), fg=ACCENT_DK
-            ).pack(side="right", padx=(0, 14))
-        if data.get("kind") == "clone":
-            self.app.link_button(
-                acts, "核对隔离", lambda: self.app.verify_lane(self.name), fg=ACCENT_DK
-            ).pack(side="right", padx=(0, 14))
-        if missing:
-            self.app.link_button(
-                acts, "补齐 API key", lambda: self.app.sync_key(self.name), fg=AMBER
-            ).pack(side="right", padx=(0, 14))
-        elif not is_primary:
-            self.app.link_button(
-                acts, "★ 设为主要版本", lambda: self.app.set_primary_lane(self.name), fg=ACCENT
-            ).pack(side="right", padx=(0, 14))
-
+        # ── 说明文字单独占一行；操作链接另起一行右对齐
+        # 原来这俩挤在同一行：链接一多（现在有 5~7 个），_rewrap 算出的可用宽度就会
+        # 撞到 120px 下限，说明被压成竖排。分成两行后说明能用满宽度，链接也不再打架。
         if is_primary:
             note_text = (
                 "主要版本＝你日常真正在用的那一套。新建版本会自动复制它的 API key"
@@ -277,6 +271,7 @@ class LaneCard(tk.Frame):
         else:
             note_text = "设为主要版本后，以后新建的版本会自动继承它的 API key。"
             note_fg = GRAY
+
         note = tk.Label(
             foot,
             text=note_text,
@@ -285,19 +280,53 @@ class LaneCard(tk.Frame):
             font=(FONT_UI, 8),
             justify="left",
             anchor="w",
-            wraplength=300,
+            wraplength=420,
         )
-        note.pack(side="left", fill="x", expand=True)
+        note.pack(fill="x")
 
+        # 次要操作：圆角按钮比原来的文字链宽，一行塞不下 7 个 → 每行最多 5 个，多了自动换行。
+        # 列表按**从左到右**的阅读顺序构建（身份类 → 内容类 → 删除），pack 时倒序贴右侧。
+        acts_items = []
+        if missing:
+            acts_items.append(("补齐 API key", lambda: self.app.sync_key(self.name), AMBER))
+        elif not is_primary:
+            acts_items.append(
+                ("★ 设为主要版本", lambda: self.app.set_primary_lane(self.name), ACCENT)
+            )
+        if data.get("kind") == "clone":
+            acts_items.append(("核对隔离", lambda: self.app.verify_lane(self.name), ACCENT_DK))
+        if not is_primary:
+            acts_items.append(
+                ("同步对话…", lambda: self.app.sync_chat_dialog(self.name), ACCENT_DK)
+            )
+        acts_items += [
+            ("备份对话…", lambda: self.app.chat_dialog(self.name), ACCENT_DK),
+            ("插件市场…", lambda: self.app.market_dialog(self.name), ACCENT_DK),
+            ("升级版本…", lambda: self.app.upgrade_dialog(self.name), ACCENT_DK),
+            ("复制…", lambda: self.app.clone_lane(self.name), ACCENT_DK),
+            ("删除这套 DSH", lambda: self.app.delete_lane(self.name), RED),
+        ]
+
+        # 5 个以内单行；超过则每行 4 个（避免最后一行只剩一两个孤儿按钮）
+        if len(acts_items) <= 5:
+            groups = [acts_items]
+        else:
+            groups = [acts_items[i:i + 4] for i in range(0, len(acts_items), 4)]
+        for chunk in groups:
+            row_f = tk.Frame(foot, bg=CARD)
+            row_f.pack(fill="x", pady=(3, 0))
+            # 左对齐：说明和链接都从左边起头，右下的空白比左下的空白看着自然
+            for text, cmd, color in chunk:
+                self.app.link_button(row_f, text, cmd, fg=color).pack(side="left", padx=(0, 8))
+
+        # 两行布局之后说明是满宽的，只需跟随 foot 宽度即可
         def _rewrap(event) -> None:
-            # 减去右侧按钮占的宽度，否则文字会绕到按钮下面被盖住
             try:
-                reserved = acts.winfo_reqwidth() + 16
+                w = max(200, event.width - 8)
+                if abs(int(note.cget("wraplength")) - w) > 12:
+                    note.configure(wraplength=w)
             except tk.TclError:
-                reserved = 0
-            w = max(120, event.width - reserved)
-            if abs(int(note.cget("wraplength")) - w) > 12:
-                note.configure(wraplength=w)
+                pass
 
         foot.bind("<Configure>", _rewrap)
 
@@ -305,7 +334,8 @@ class LaneCard(tk.Frame):
         def bind_open(widget) -> None:
             widget.bind("<Double-Button-1>", lambda _e: self.app.open_lane(self.name))
             for child in widget.winfo_children():
-                if not isinstance(child, tk.Button):
+                # 按钮/胶囊/芯片上不要再挂双击打开（它们自己处理点击，双击会点两次）
+                if not isinstance(child, (tk.Button, ui.RoundedButton, ui.Pill, ui.Chip)):
                     bind_open(child)
 
         bind_open(self)
@@ -369,6 +399,24 @@ class LauncherApp:
                 "warn",
             )
 
+        # 受限令牌（沙箱）是最容易看错的一种失败：文件权限、icacls 全都正常，
+        # 但写文件/结束进程一律被拒。直接点名，省得用户去查 D 盘权限。
+        tok = core.token_state()
+        if tok.get("restricted"):
+            self.log("[!!] 这个窗口被关在受限沙箱里（restricted token）——不是 D 盘权限问题", "warn")
+            self.log(
+                "     表现：写不了 D:\\dsh-lanes、停不掉别的进程、打开 lane 也起不来。",
+                "warn",
+            )
+            self.log(
+                "     原因：它是从 DSH 的终端 / 工具 / 沙箱里拉起来的，令牌被裁剪过。",
+                "warn",
+            )
+            self.log(
+                "     解法：关掉这个窗口，去资源管理器双击 exe（或桌面快捷方式）。",
+                "warn",
+            )
+
     # ── 基础 ────────────────────────────────────────────────────────────────
     def _center(self, w: int, h: int) -> None:
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -385,53 +433,43 @@ class LauncherApp:
         style.configure("TEntry", padding=4)
         style.configure("Vertical.TScrollbar", background=BORDER, troughcolor=BG, borderwidth=0)
 
-    def button(self, master, text, command, primary=False, danger=False, width=None):
-        bg = ACCENT if primary else (RED_BG if danger else "#FFFFFF")
-        fg = "#FFFFFF" if primary else (RED if danger else TEXT)
-        active = ACCENT_DK if primary else ("#FBE2E2" if danger else "#F0F1F3")
-        btn = tk.Button(
-            master,
-            text=text,
-            command=command,
-            bg=bg,
-            fg=fg,
-            activebackground=active,
-            activeforeground=fg,
-            relief="flat",
-            bd=0,
-            padx=12,
-            pady=5,
-            cursor="hand2",
-            font=(FONT_UI, 9),
-            highlightthickness=0,
+    def button(self, master, text, command, primary=False, danger=False, width=None,
+               size="md", icon="", variant=None):
+        """圆角按钮工厂（返回 ui_kit.RoundedButton，不再是 tk.Button）。
+
+        签名对旧调用**向后兼容**：primary / danger / width 照旧。新增三个可选参数：
+          size    md(30px) / sm(26px) / xs(22px)
+          icon    文字前的符号（⟳ ⧉ ■ ＋ 等），跟文字同一字体测宽
+          variant 直接指定四变体（primary/secondary/ghost/danger），优先于 primary/danger
+
+        注意：Canvas 的 width 是**像素**，而旧签名传的是"字符数"。这里按 1 字≈8px 折算，
+        只是防止老调用点传参时按钮突然变窄。
+        """
+        kind = variant or ("primary" if primary else ("danger" if danger else "secondary"))
+        px = int(width) * 8 + 16 if width else None
+        try:
+            owner_bg = master.cget("bg")
+        except Exception:
+            owner_bg = CARD
+        return ui.RoundedButton(
+            master, text, command, variant=kind, size=size,
+            icon=icon, width=px, bg=owner_bg,
         )
-        if width:
-            btn.configure(width=width)
-        return btn
 
     def link_button(self, master, text, command, fg=None, bg=None):
-        """文字链式小按钮（次要操作用，避免一行塞四五个方块按钮）。"""
-        color = fg or TEXT
-        back = bg or CARD
-        btn = tk.Button(
-            master,
-            text=text,
-            command=command,
-            bg=back,
-            fg=color,
-            activebackground=back,
-            activeforeground=color,
-            relief="flat",
-            bd=0,
-            padx=2,
-            pady=0,
-            cursor="hand2",
-            font=(FONT_UI, 9),
-            highlightthickness=0,
+        """次要操作的"文字链"——统一成幽灵圆角按钮（无边框，hover 出浅灰底）。
+
+        签名不变：fg 覆盖文字颜色（蓝 / 红 / 琥珀）；bg 一般不用传，自动取父容器底色。
+        以前这里是 tk.Button + hover 下划线，和主按钮的圆角风格不统一。
+        """
+        try:
+            owner_bg = bg or master.cget("bg")
+        except Exception:
+            owner_bg = CARD
+        return ui.RoundedButton(
+            master, text, command, variant="ghost", size="xs",
+            fg=fg or TEXT, bg=owner_bg,
         )
-        btn.bind("<Enter>", lambda _e: btn.configure(font=(FONT_UI, 9, "underline")))
-        btn.bind("<Leave>", lambda _e: btn.configure(font=(FONT_UI, 9)))
-        return btn
 
     # ── 下载源选择（新建 / 升级共用） ─────────────────────────────────────────
     def registry_row(self, parent, cfg: dict, pady=(12, 0)):
@@ -516,50 +554,57 @@ class LauncherApp:
 
     # ── 顶部 ────────────────────────────────────────────────────────────────
     def _build_header(self) -> None:
-        head = tk.Frame(self.root, bg=BG)
-        head.pack(fill="x", padx=18, pady=(14, 8))
+        self._remote_payload: dict | None = None   # 上一次查到的 npm 版本（窄窗口要按宽度重排）
+        self._remote_job = None
+        # 顶部工具栏：白底 + 一条下边框。原来整页都是灰底、按钮直接浮在上面，
+        # 看不出"窗口骨架"；加这一条之后，头/身/脚三段才分得开。
+        shell = tk.Frame(self.root, bg=CARD)
+        shell.pack(fill="x")
+        tk.Frame(shell, bg=BORDER, height=1).pack(side="bottom", fill="x")
+        head = tk.Frame(shell, bg=CARD)
+        head.pack(fill="x", padx=18, pady=(12, 10))
 
         # 右侧按钮**先** pack：窗口拉到最窄时宁可挤左边的文字，也不能把「＋ 新建版本」挤没
-        right = tk.Frame(head, bg=BG)
+        right = tk.Frame(head, bg=CARD)
         right.pack(side="right")
-        self.button(right, "刷新", self.manual_refresh).pack(side="left", padx=4)
-        self.button(right, "环境自检", lambda: self.run_job("环境自检", lambda: core.cmd_doctor(self.cfg, None))).pack(
-            side="left", padx=4
+        # 「官方代码库」放这一簇里：夹在 npm 那行会被挤掉（窄窗口下整行都会被裁）
+        self.link_button(right, "官方代码库 ↗", self.open_repo, fg=ACCENT_DK).pack(
+            side="left", padx=(0, 12)
         )
-        self.button(right, "全部停止", self.stop_all, danger=True).pack(side="left", padx=4)
-        self.button(right, "打开根目录", self.open_root_dir).pack(side="left", padx=4)
-        self.button(right, "＋ 新建版本", self.new_version_dialog, primary=True).pack(side="left", padx=(10, 0))
+        self.button(right, "刷新", self.manual_refresh, variant="ghost").pack(
+            side="left", padx=2
+        )
+        self.button(right, "环境自检", lambda: self.run_job("环境自检", lambda: core.cmd_doctor(self.cfg, None)),
+                    variant="ghost").pack(side="left", padx=2)
+        self.button(right, "全部停止", self.stop_all, danger=True).pack(side="left", padx=6)
+        self.button(right, "打开根目录", self.open_root_dir).pack(side="left", padx=6)
+        self.button(right, "＋ 新建版本", self.new_version_dialog, primary=True).pack(
+            side="left", padx=(10, 0)
+        )
 
-        left = tk.Frame(head, bg=BG)
+        left = tk.Frame(head, bg=CARD)
         left.pack(side="left", fill="x", expand=True)
-        tk.Label(left, text="DSH 多版本启动器", bg=BG, fg=TEXT, font=(FONT_UI, 15, "bold")).pack(anchor="w")
-        self.sub = tk.Label(
-            left,
-            text="★ 主要版本常驻置顶　·　新建版本自动继承它的 API key　·　双击卡片即可打开",
-            bg=BG,
-            fg=MUTED,
-            font=(FONT_UI, 9),
-        )
-        self.sub.pack(anchor="w", pady=(2, 0))
+        tk.Label(left, text="DSH 多版本启动器", bg=CARD, fg=TEXT, font=(FONT_UI, 15, "bold")).pack(anchor="w")
 
-        # 第三行：npm 上现在有哪些版本（只读查询）+ 官方代码库入口
-        remote = tk.Frame(left, bg=BG)
-        remote.pack(anchor="w", pady=(4, 0))
-        self.remote_label = tk.Label(
-            remote,
-            text="正在查询 npm 上的最新版本…",
-            bg=BG,
-            fg=MUTED,
-            font=(FONT_UI, 9),
-            anchor="w",
-        )
-        self.remote_label.pack(side="left")
-        self.link_button(remote, "官方代码库 ↗", self.open_repo, fg=ACCENT_DK).pack(side="left", padx=(10, 0))
+        # 第二行：npm 上现在有哪些版本（只读查询）+ 官方代码库入口。
+        # 版本号改成芯片排：原来是一串「latest 0.2.1-rc.2√　·　next 0.2.1-rc.3　·　…」，
+        # 挤在一起要靠读才知道哪个是本机已有的；芯片能一眼分出"有"和"没有"。
+        #
+        # 原来夹在标题和这一行中间的「★ 主要版本常驻置顶 · 新建版本自动继承它的 API key ·
+        # 双击卡片即可打开」撤掉了：这三条在卡片说明里、日志开头的欢迎语里都已经讲过，
+        # 常驻在标题下面只是噪音，还挡住视线。
+        remote = tk.Frame(left, bg=CARD)
+        remote.pack(anchor="w", pady=(6, 0))
+        self.remote_box = tk.Frame(remote, bg=CARD)     # 内容每次查询完重建
+        self.remote_box.pack(side="left")
+        self._remote_note("正在查询 npm 上的版本…", ui.SUBTLE)
+        self._header_left = left
+        left.bind("<Configure>", self._on_header_resize)
 
     # ── 主体 ────────────────────────────────────────────────────────────────
     def _build_body(self) -> None:
         body = tk.Frame(self.root, bg=BG)
-        body.pack(fill="both", expand=True, padx=18, pady=(0, 8))
+        body.pack(fill="both", expand=True, padx=18, pady=(12, 8))
         body.columnconfigure(0, weight=3, minsize=430)
         body.columnconfigure(1, weight=2, minsize=330)
         body.rowconfigure(0, weight=1)
@@ -572,8 +617,8 @@ class LauncherApp:
 
         self.canvas = tk.Canvas(left_wrap, bg=BG, highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(left_wrap, orient="vertical", command=self.canvas.yview)
-        sb.grid(row=0, column=1, sticky="ns")
+        sb = ui.MiniScrollbar(left_wrap, command=self.canvas.yview, bg=BG)
+        sb.grid(row=0, column=1, sticky="ns", padx=(2, 0))
         self.canvas.configure(yscrollcommand=sb.set)
 
         self.list_frame = tk.Frame(self.canvas, bg=BG)
@@ -586,7 +631,7 @@ class LauncherApp:
         )
         self.canvas.bind_all("<MouseWheel>", self._on_wheel)
 
-        # 右：日志
+        # 右：日志 —— 圆角面板 + 时间戳列 + 级别标记 + 空状态 + 自动滚动
         right = tk.Frame(body, bg=BG)
         right.grid(row=0, column=1, sticky="nsew")
         right.rowconfigure(1, weight=1)
@@ -595,48 +640,118 @@ class LauncherApp:
         bar = tk.Frame(right, bg=BG)
         bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         tk.Label(bar, text="实时日志", bg=BG, fg=TEXT, font=(FONT_UI, 11, "bold")).pack(side="left")
-        self.button(bar, "清空", self.clear_log).pack(side="right")
-        self.button(bar, "复制全部", self.copy_log).pack(side="right", padx=4)
+        self.log_count = tk.Label(bar, text="", bg=BG, fg=ui.SUBTLE, font=(FONT_UI, 9))
+        self.log_count.pack(side="left", padx=(8, 0))
+        self.button(bar, "清空", self.clear_log, variant="ghost", size="sm").pack(side="right")
+        self.button(bar, "复制全部", self.copy_log, variant="ghost", size="sm").pack(
+            side="right", padx=4
+        )
 
-        wrap = tk.Frame(right, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-        wrap.grid(row=1, column=0, sticky="nsew")
+        panel = ui.RoundedCard(
+            right, bg=CARD, border=BORDER, radius=10,
+            padx=4, pady=4, fill=True, width=1, height=1,
+        )
+        panel.grid(row=1, column=0, sticky="nsew")
+        wrap = panel.inner
         wrap.rowconfigure(0, weight=1)
         wrap.columnconfigure(0, weight=1)
+
+        # 日志排版：时间戳小一号、级别字形一列、正文 10pt；折行用 lmargin2 缩进到正文起点。
+        self._f_log = tkfont.Font(family=FONT_MONO, size=10)
+        self._f_ts = tkfont.Font(family=FONT_MONO, size=9)
+        self._f_log_b = tkfont.Font(family=FONT_MONO, size=10, weight="bold")
+        self._log_indent = self._f_ts.measure("00:00:00 ") + self._f_log.measure(_LOG_GLYPH_W)
+
         self.log_text = tk.Text(
             wrap,
             width=1,  # 关键：默认 80 字符会撑爆右列、把左列压扁（grid 先满足请求宽度再分权重）
             height=1,
-            bg="#FBFBFC",
+            bg=CARD,
             fg=TEXT,
             relief="flat",
-            wrap="word",
-            font=(FONT_MONO, 9),
+            bd=0,
+            highlightthickness=0,
+            # 中文日志里整段没有空格，用 word 换行时 Tk 会把整段当成一个"词"，
+            # 前面放不下就整段挪到下一行 —— 结果行首只剩个时间戳和字形。
+            # 按字符换行才是中文的正确行为（浏览器对 CJK 也是按字断行）。
+            wrap="char",
+            font=self._f_log,
             padx=10,
             pady=8,
+            spacing1=1,
+            spacing3=1,
             insertbackground=TEXT,
             state="disabled",
         )
         self.log_text.grid(row=0, column=0, sticky="nsew")
-        lsb = ttk.Scrollbar(wrap, orient="vertical", command=self.log_text.yview)
-        lsb.grid(row=0, column=1, sticky="ns")
-        self.log_text.configure(yscrollcommand=lsb.set)
-        self.log_text.tag_configure("head", foreground=ACCENT, font=(FONT_MONO, 9, "bold"))
-        self.log_text.tag_configure("ok", foreground=GREEN)
-        self.log_text.tag_configure("err", foreground=RED)
-        self.log_text.tag_configure("warn", foreground=AMBER)
-        self.log_text.tag_configure("muted", foreground=MUTED)
+        self.log_sb = ui.MiniScrollbar(wrap, command=self.log_text.yview, bg=CARD)
+        self.log_sb.grid(row=0, column=1, sticky="ns", padx=(0, 4))
+        self.log_text.configure(yscrollcommand=self.log_sb.set)
+
+        T = self.log_text
+        T.tag_configure("ts", foreground=ui.SUBTLE, font=self._f_ts)
+        T.tag_configure("pad", font=self._f_log)          # 只有对齐用的空格，不上色
+        for lvl, (_glyph, mk_fg, msg_fg, bold) in _LOG_STYLE.items():
+            T.tag_configure(f"mk_{lvl}", foreground=mk_fg, font=self._f_log_b)
+            T.tag_configure(
+                f"m_{lvl}",
+                foreground=msg_fg,
+                font=(self._f_log_b if bold else self._f_log),
+                lmargin2=self._log_indent,
+                spacing1=(9 if lvl == "head" else 2),   # 小节标题上方留白，日志才分得段
+                spacing3=1,
+            )
+
+        # 空状态：日志一条都没有时，别让面板塌成一张白纸
+        self._log_hint = tk.Frame(wrap, bg=CARD)
+        tk.Label(self._log_hint, text="还没有日志", bg=CARD, fg=TEXT,
+                 font=(FONT_UI, 11, "bold")).pack()
+        tk.Label(
+            self._log_hint,
+            text="打开任意版本、刷新，或做一次操作，\n输出会实时出现在这里。",
+            bg=CARD, fg=MUTED, font=(FONT_UI, 9), justify="center",
+        ).pack(pady=(5, 11))
+        keys = tk.Frame(self._log_hint, bg=CARD)
+        keys.pack()
+        for key_text in ("F5 刷新", "Ctrl+L 清空", "Ctrl+N 新建"):
+            ui.Chip(keys, key_text, "key", bg=CARD).pack(side="left", padx=3)
+        self._show_log_hint()
+
+        # 自动滚动：手动往上翻就停住，右下角浮出「回到最新」，而不是每来一行把你拽回底部
+        self._autoscroll = True
+        self._back_btn = self.button(
+            wrap, "↓ 回到最新", self._scroll_to_bottom, variant="primary", size="xs"
+        )
+        T.bind("<MouseWheel>", self._on_log_wheel, add="+")
+        for seq in ("<ButtonRelease-1>", "<B1-Motion>", "<KeyRelease>"):
+            T.bind(seq, lambda _e: self.root.after(20, self._sync_autoscroll), add="+")
 
     def _build_status(self) -> None:
-        bar = tk.Frame(self.root, bg=BG)
-        bar.pack(fill="x", padx=18, pady=(0, 12))
-        self.status = tk.Label(bar, text="就绪", bg=BG, fg=MUTED, font=(FONT_UI, 9), anchor="w")
+        # 底部状态条：和顶部一样是一条白带 + 上边框，收住整个窗口
+        shell = tk.Frame(self.root, bg=CARD)
+        shell.pack(fill="x")
+        tk.Frame(shell, bg=BORDER, height=1).pack(side="top", fill="x")
+        bar = tk.Frame(shell, bg=CARD)
+        bar.pack(fill="x", padx=18, pady=7)
+        self.status = tk.Label(bar, text="就绪", bg=CARD, fg=MUTED, font=(FONT_UI, 9), anchor="w")
         self.status.pack(side="left")
-        self.busy_label = tk.Label(bar, text="", bg=BG, fg=ACCENT, font=(FONT_UI, 9, "bold"))
+        self.busy_label = tk.Label(bar, text="", bg=CARD, fg=ACCENT, font=(FONT_UI, 9, "bold"))
         self.busy_label.pack(side="right")
-        self.counts = tk.Label(bar, text="", bg=BG, fg=MUTED, font=(FONT_UI, 9))
+        self.counts = tk.Label(bar, text="", bg=CARD, fg=MUTED, font=(FONT_UI, 9))
         self.counts.pack(side="right", padx=14)
 
     def _on_wheel(self, event) -> None:
+        # 这个绑定是 bind_all 的，日志面板里滚轮也会冒过来：只有指针真在列表上才滚列表
+        try:
+            w = self.root.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            w = None
+        while w is not None:
+            if w is self.canvas:
+                break
+            w = getattr(w, "master", None)
+        else:
+            return
         try:
             self.canvas.yview_scroll(int(-event.delta / 120), "units")
         except tk.TclError:
@@ -646,43 +761,122 @@ class LauncherApp:
     def _tag_for(self, text: str, tag: str | None = None) -> str:
         if tag:
             return tag
-        if "[OK]" in text:
-            return "ok"
-        if "[XX]" in text:
-            return "err"
-        if "[!!]" in text:
-            return "warn"
+        for marker, lvl in _LOG_MARKERS:
+            if text.startswith(marker):
+                return lvl
         return ""
+
+    def _split_line(self, line: str, tag: str | None) -> tuple:
+        """把一行拆成 (级别, 正文)。
+
+        `[OK]` / `[XX]` / `[!!]` 前缀换成对应颜色的一个字形，正文保持中性色——
+        整行染绿会让日志变得花里胡哨，真正该注意的红色反而被淹没。
+        小节标题（`──── 打开 lane：global ────`）去掉装饰线本身，靠颜色和上方留白分区。
+        """
+        for marker, lvl in _LOG_MARKERS:
+            if line.startswith(marker):
+                line = line[len(marker):].lstrip()
+                tag = tag or lvl
+                break
+        lvl = tag if tag in _LOG_STYLE else ""
+        if lvl == "head":
+            line = line.strip().strip("─").strip()
+        else:
+            # 正文里那些"     └ 补充说明"式的悬挂缩进要丢掉：
+            # 和左边的痕迹列拼在一起时，行首那几个空格会变成唯一的换行点，
+            # 结果就是"23:28:20 !"孤零零一行、正文掉到下一行去。
+            line = line.lstrip()
+        return lvl, line
 
     def _log_lines(self, items: list[tuple[str, str | None]]) -> None:
         """批量写日志：一次插入、只滚动一次、并裁掉过老的尾巴。
 
         安装 npm 时一秒能来上百行，逐行 insert + 逐行 see("end") 会把界面拖住；
         而且文本控件只增不减，跑几次安装后连滚动都会变卡。
+
+        v3 排版：每行 = 时间戳 + 级别字形 + 正文，三块各占一列（等宽字，天然对齐）。
+        一条消息自带多行时只有首行带时间戳，续行留白——否则同一秒里几十行
+        都顶着同一个时刻，反而更乱。
         """
         if not items:
             return
         text = self.log_text
+        stamp = time.strftime("%H:%M:%S")
         text.configure(state="normal")
         for raw, tag in items:
-            line = ANSI_RE.sub("", str(raw))
-            text.insert("end", line + "\n", self._tag_for(line, tag))
+            block = ANSI_RE.sub("", str(raw)).split("\n")
+            lvl, body = self._split_line(block[0], tag)
+            text.insert("end", stamp + " ", "ts")
+            text.insert("end", _LOG_STYLE[lvl][0] + " ", f"mk_{lvl}")
+            text.insert("end", body + "\n", f"m_{lvl}")
+            for line in block[1:]:      # 续行：空出前两列，不再重复时间戳和字形
+                text.insert("end", " " * 9, "ts")
+                text.insert("end", "  ", "pad")
+                text.insert("end", line + "\n", f"m_{lvl}")
+
+        total = 0
         try:  # 只留尾部若干行
             total = int(str(text.index("end-1c")).split(".")[0])
             if total > self._MAX_LOG_LINES:
                 text.delete("1.0", f"{total - self._MAX_LOG_LINES}.0")
+                total = self._MAX_LOG_LINES
         except (tk.TclError, ValueError):
             pass
-        text.see("end")
+        if self._autoscroll:
+            text.see("end")
         text.configure(state="disabled")
+        self._hide_log_hint()
+        self.log_count.configure(text=(f"{max(0, total - 1)} 行" if total > 1 else ""))
 
     def log(self, text: str, tag: str | None = None) -> None:
         self._log_lines([(text, tag)])
+
+    # ── 日志面板的空状态 / 自动滚动 ──
+    def _show_log_hint(self) -> None:
+        try:
+            self._log_hint.place(relx=0.5, rely=0.44, anchor="center")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _hide_log_hint(self) -> None:
+        try:
+            self._log_hint.place_forget()
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _on_log_wheel(self, event) -> str:
+        """滚轮翻日志：先滚动，再判断是否已经离开底部（所以延后一点再同步状态）。"""
+        try:
+            self.log_text.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        except tk.TclError:
+            pass
+        self.root.after(15, self._sync_autoscroll)
+        return "break"
+
+    def _sync_autoscroll(self) -> None:
+        try:
+            at_bottom = self.log_text.yview()[1] >= 0.999
+        except tk.TclError:
+            return
+        self._autoscroll = at_bottom
+        if at_bottom:
+            self._back_btn.place_forget()
+        else:                       # 停在半路：右下角浮出「回到最新」，不抢滚动
+            self._back_btn.place(relx=1.0, rely=1.0, x=-28, y=-14, anchor="se")
+
+    def _scroll_to_bottom(self) -> None:
+        self.log_text.see("end")
+        self._autoscroll = True
+        self._back_btn.place_forget()
 
     def clear_log(self) -> None:
         self.log_text.configure(state="normal")
         self.log_text.delete("1.0", "end")
         self.log_text.configure(state="disabled")
+        self._autoscroll = True
+        self._back_btn.place_forget()
+        self.log_count.configure(text="")
+        self._show_log_hint()
 
     def copy_log(self) -> None:
         self.copy_text(self.log_text.get("1.0", "end").strip())
@@ -822,10 +1016,16 @@ class LauncherApp:
         self._update_counts(snap)
 
     # ── 未登记实例 / 系统全局安装 ───────────────────────────────────────────
-    def _section(self, text: str) -> None:
-        tk.Label(
-            self.list_frame, text=text, bg=BG, fg=MUTED, font=(FONT_UI, 9, "bold")
-        ).pack(anchor="w", pady=(14, 2))
+    def _section(self, text: str, count: int | None = None, action=None) -> None:
+        """段落标题：卡片区和"下面的杂项"之间的分隔，比正文重、比卡片名轻。"""
+        bar = tk.Frame(self.list_frame, bg=BG)
+        bar.pack(fill="x", pady=(16, 6))
+        if action is not None:
+            self.link_button(bar, action[0], action[1]).pack(side="right")
+        tk.Label(bar, text=text, bg=BG, fg=TEXT,
+                 font=(FONT_UI, 10, "bold")).pack(side="left")
+        if count:
+            ui.Chip(bar, str(count), "ver", bg=BG).pack(side="left", padx=(7, 0))
 
     def _build_foreign_section(self, snap: dict) -> None:
         instances = snap["foreign"]
@@ -834,130 +1034,112 @@ class LauncherApp:
         if not instances and not installs:
             return
 
-        self._section("未登记的实例（不是本启动器启动的）")
+        # 没有未登记实例时整段省略：原来会留一个标题 +「（当前没有别的 DSH 实例在跑）」，
+        # 两行字只说明"什么都没发生"，纯属噪音。
+        if instances:
+            self._section("未登记的实例（不是本启动器启动的）", len(instances))
+            for item in instances:
+                card = ui.RoundedCard(
+                    self.list_frame, bg=CARD, border=BORDER, radius=10, padx=13, pady=10,
+                )
+                card.pack(fill="x", pady=4)
+                pad = card.inner
 
-        if not instances:
-            tk.Label(
-                self.list_frame,
-                text="（当前没有别的 DSH 实例在跑）",
-                bg=BG,
-                fg=GRAY,
-                font=(FONT_UI, 9),
-            ).pack(anchor="w", pady=(0, 4))
+                btns = tk.Frame(pad, bg=CARD)
+                btns.pack(side="right")
+                self.button(btns, "打开页面", lambda u=item["url"]: self.open_url(u),
+                            primary=True, size="sm").pack(side="left", padx=3)
+                self.button(btns, "结束进程", lambda i=item: self.kill_instance(i),
+                            danger=True, size="sm").pack(side="left", padx=3)
 
-        for item in instances:
-            card = tk.Frame(self.list_frame, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-            card.pack(fill="x", pady=4)
-            pad = tk.Frame(card, bg=CARD)
-            pad.pack(fill="x", padx=14, pady=11)
+                ui.Pill(pad, "像是 DSH" if item["dsh_like"] else "占用中",
+                        "warn" if item["dsh_like"] else "off",
+                        bg=CARD).pack(side="right", padx=(0, 12))
 
-            btns = tk.Frame(pad, bg=CARD)
-            btns.pack(side="right")
-            self.button(btns, "打开页面", lambda u=item["url"]: self.open_url(u), primary=True).pack(
-                side="left", padx=3
-            )
-            self.button(btns, "结束进程", lambda i=item: self.kill_instance(i), danger=True).pack(
-                side="left", padx=3
-            )
-
-            flag = "● 像是 DSH" if item["dsh_like"] else "○ 占用中"
-            tk.Label(
-                pad,
-                text=flag,
-                bg=(AMBER_BG if item["dsh_like"] else GRAY_BG),
-                fg=(AMBER if item["dsh_like"] else GRAY),
-                font=(FONT_UI, 9, "bold"),
-                padx=10,
-                pady=3,
-            ).pack(side="right", padx=(0, 12))
-
-            left = tk.Frame(pad, bg=CARD)
-            left.pack(side="left", fill="x", expand=True)
-            tk.Label(
-                left,
-                text=f"端口 {item['port']}",
-                bg=CARD,
-                fg=TEXT,
-                font=(FONT_UI, 12, "bold"),
-            ).pack(anchor="w")
-            tk.Label(
-                left,
-                text=f"PID {item['pid']}　进程 {item['exe']}",
-                bg=CARD,
-                fg=MUTED,
-                font=(FONT_UI, 9),
-            ).pack(anchor="w", pady=(3, 0))
-            tk.Label(
-                left,
-                text=f"启动于 {item.get('started') or '?'}　·　非本启动器管理",
-                bg=CARD,
-                fg=GRAY,
-                font=(FONT_UI, 8),
-            ).pack(anchor="w", pady=(1, 0))
-            link = tk.Label(
-                left,
-                text=item["url"] + "   ⧉ 点击复制",
-                bg=CARD,
-                fg=ACCENT,
-                font=(FONT_MONO, 8),
-                cursor="hand2",
-                anchor="w",
-            )
-            link.pack(anchor="w", pady=(2, 0))
-            link.bind("<Button-1>", lambda _e, u=item["url"]: self.copy_text(u))
+                left = tk.Frame(pad, bg=CARD)
+                left.pack(side="left", fill="x", expand=True)
+                tk.Label(
+                    left,
+                    text=f"端口 {item['port']}",
+                    bg=CARD,
+                    fg=TEXT,
+                    font=(FONT_UI, 13, "bold"),
+                ).pack(anchor="w")
+                tk.Label(
+                    left,
+                    text=f"PID {item['pid']}　进程 {item['exe']}",
+                    bg=CARD,
+                    fg=MUTED,
+                    font=(FONT_UI, 9),
+                ).pack(anchor="w", pady=(3, 0))
+                tk.Label(
+                    left,
+                    text=f"启动于 {item.get('started') or '?'}　·　非本启动器管理",
+                    bg=CARD,
+                    fg=GRAY,
+                    font=(FONT_UI, 8),
+                ).pack(anchor="w", pady=(1, 0))
+                link = tk.Label(
+                    left,
+                    text=item["url"] + "   ⧉ 点击复制",
+                    bg=CARD,
+                    fg=ACCENT,
+                    font=(FONT_MONO, 8),
+                    cursor="hand2",
+                    anchor="w",
+                )
+                link.pack(anchor="w", pady=(2, 0))
+                link.bind("<Button-1>", lambda _e, u=item["url"]: self.copy_text(u))
 
         if installs:
-            card = tk.Frame(self.list_frame, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
+            self._section(
+                "本机各套安装（你平时在用的那份在这里）",
+                len(installs),
+                action=("打开根目录", self.open_root_dir),
+            )
+            card = ui.RoundedCard(
+                self.list_frame, bg=CARD, border=BORDER, radius=10, padx=13, pady=10,
+            )
             card.pack(fill="x", pady=4)
-            pad = tk.Frame(card, bg=CARD)
-            pad.pack(fill="x", padx=14, pady=11)
-            self.button(pad, "打开根目录", self.open_root_dir).pack(side="right")
-            left = tk.Frame(pad, bg=CARD)
-            left.pack(side="left", fill="x", expand=True)
-            tk.Label(
-                left,
-                text="本机各套安装（你平时在用的那份在这里）",
-                bg=CARD,
-                fg=TEXT,
-                font=(FONT_UI, 12, "bold"),
-            ).pack(anchor="w")
-            for item in installs:
-                row = tk.Frame(left, bg=CARD)
-                row.pack(fill="x", pady=(3, 0))
+            pad = card.inner
+            for idx, item in enumerate(installs):
+                if idx:
+                    tk.Frame(pad, bg="#EDEFF2", height=1).pack(fill="x", pady=8)
+                row = tk.Frame(pad, bg=CARD)
+                row.pack(fill="x")
                 self.button(
-                    row,
-                    "加入 lane 列表",
-                    lambda i=item: self.adopt_install(i),
-                ).pack(side="right", padx=(8, 0))
+                    row, "加入 lane 列表", lambda i=item: self.adopt_install(i), size="sm",
+                ).pack(side="right", padx=(10, 0))
                 text = tk.Frame(row, bg=CARD)
                 text.pack(side="left", fill="x", expand=True)
                 tk.Label(
                     text,
-                    text=f"{item['source']}　·　{item['version']}　·　写入 {item.get('installedAt') or '?'}",
-                    bg=CARD,
-                    fg=MUTED,
-                    font=(FONT_UI, 9),
-                    anchor="w",
+                    text=f"{item['source']}　·　{item['version']}",
+                    bg=CARD, fg=TEXT, font=(FONT_UI, 10, "bold"), anchor="w",
                 ).pack(anchor="w")
                 tk.Label(
                     text,
-                    text=item["path"],
-                    bg=CARD,
-                    fg=GRAY,
-                    font=(FONT_MONO, 8),
-                    anchor="w",
-                    wraplength=250,
-                    justify="left",
+                    text=f"写入 {item.get('installedAt') or '?'}",
+                    bg=CARD, fg=MUTED, font=(FONT_UI, 9), anchor="w",
                 ).pack(anchor="w")
-            tk.Label(
-                left,
+                path_lbl = tk.Label(
+                    text,
+                    text=item["path"],
+                    bg=CARD, fg=ui.SUBTLE, font=(FONT_MONO, 8),
+                    anchor="w", justify="left", cursor="hand2", wraplength=250,
+                )
+                path_lbl.pack(anchor="w", pady=(2, 0))
+                path_lbl.bind("<Button-1>", lambda _e, p=item["path"]: self.copy_text(p))
+                # 路径很长，宽度跟着卡片走，别写死 250 把路径折成三四行
+                # （比一下再改：无脑 configure 会触发新的 <Configure>，来回抖）
+                text.bind("<Configure>", lambda e, l=path_lbl: _set_wrap(l, e.width, 160))
+            help_lbl = tk.Label(
+                pad,
                 text="「加入 lane 列表」＝用它现有的 DSH_HOME（~/.dsh）注册成一条 lane，之后就能在这里打开/停止它。",
-                bg=CARD,
-                fg=GRAY,
-                font=(FONT_UI, 8),
-                wraplength=330,
-                justify="left",
-            ).pack(anchor="w", pady=(4, 0))
+                bg=CARD, fg=GRAY, font=(FONT_UI, 8), justify="left", wraplength=330,
+            )
+            help_lbl.pack(anchor="w", pady=(9, 0))
+            pad.bind("<Configure>", lambda e, l=help_lbl: _set_wrap(l, e.width, 240))
 
     def _tick(self) -> None:
         if not self.busy:
@@ -1093,13 +1275,13 @@ class LauncherApp:
         if not force and time.time() - self._remote_at < 600:
             return
         self._remote_busy = True
-        self.remote_label.configure(text="正在查询 npm 上的最新版本…", fg=MUTED)
+        self._remote_note("正在查询 npm 上的版本…", ui.SUBTLE)
 
         # 本机已装了哪些版本（拿登记表比，不发任何请求）
         installed = {str((d or {}).get("version") or "") for d in (self.cfg.get("lanes") or {}).values()}
 
         def fail(reason: str) -> None:
-            self._remote_done("查不到 npm 上的版本（离线或 registry 不通），点「刷新」重试", AMBER)
+            self._remote_done({"error": "查不到 npm 上的版本（离线或 registry 不通），点「刷新」重试"})
             self.log(f"[!!] 查询 npm 版本失败：{reason}", "warn")
 
         def worker() -> None:
@@ -1113,20 +1295,86 @@ class LauncherApp:
             tags = packument.get("dist-tags") or {}
             order = ["latest", "next", "alpha"]
             keys = [k for k in order if k in tags] + sorted(k for k in tags if k not in order)
-            bits = [f"{tag} {tags[tag]}" + ("√" if str(tags[tag]) in installed else "") for tag in keys]
-            # 把实际答话的源写在这儿：镜像常常落后官方一两天，"这行数字从哪来"必须看得见
-            text = f"npm 上（{core.registry_label(reg)}）：" + "　·　".join(bits)
-            self.q.put(("callback", lambda: self._remote_done(text, MUTED)))
+            # 把实际答话的源带上：镜像常常落后官方一两天，"这行数字从哪来"必须看得见
+            payload = {
+                "source": core.registry_label(reg),
+                "tags": [(tag, str(tags[tag]), str(tags[tag]) in installed) for tag in keys],
+            }
+            self.q.put(("callback", lambda p=payload: self._remote_done(p)))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _remote_done(self, text: str, fg: str) -> None:
-        self._remote_busy = False
-        self._remote_at = time.time()
+    # ── 标题下那行：状态文字 / 版本芯片 ──
+    def _remote_reset_box(self) -> None:
+        for child in self.remote_box.winfo_children():
+            child.destroy()
+
+    def _remote_note(self, text: str, fg: str) -> None:
+        """只显示一句话（查询中 / 查不到）。"""
+        self._remote_payload = None
         try:
-            self.remote_label.configure(text=text, fg=fg)
+            self._remote_reset_box()
+            tk.Label(self.remote_box, text=text, bg=CARD, fg=fg,
+                     font=(FONT_UI, 9)).pack(side="left")
         except tk.TclError:
             pass
+
+    def _remote_done(self, payload: dict) -> None:
+        self._remote_busy = False
+        self._remote_at = time.time()
+        if payload.get("error"):
+            self._remote_note(payload["error"], AMBER)
+            return
+        self._remote_payload = payload
+        self._render_remote()
+
+    def _render_remote(self) -> None:
+        """把 dist-tag 排成芯片；窗口窄就先丢后面的，别让芯片被切一半。"""
+        payload = self._remote_payload
+        if not payload:
+            return
+        self._remote_job = None
+        try:
+            self._remote_reset_box()
+            src = tk.Label(
+                self.remote_box, text=f"npm · {payload['source']}", bg=CARD,
+                fg=ui.SUBTLE, font=(FONT_UI, 8),
+            )
+            src.pack(side="left", padx=(0, 8))
+            # 预留 "+N" 那个小标签的位置：不然放完芯片再补它，整行又超了
+            avail = max(90, self._header_left.winfo_width() - 34)
+            used = src.winfo_reqwidth() + 8
+            overflow = 0
+            for tag, ver, have in payload["tags"]:
+                chip = ui.Chip(
+                    self.remote_box,
+                    f"{tag} {ver}" + ("  ✓" if have else ""),
+                    "ok" if have else "ver",
+                    bg=CARD,
+                )
+                need = chip.winfo_reqwidth() + 5
+                if used + need > avail:      # 放不下：销毁它，记一笔"还有几个没显示"
+                    chip.destroy()
+                    overflow += 1
+                    continue
+                chip.pack(side="left", padx=(0, 5))
+                used += need
+            if overflow:
+                tk.Label(self.remote_box, text=f"+{overflow}", bg=CARD, fg=ui.SUBTLE,
+                         font=(FONT_UI, 8)).pack(side="left", padx=(2, 0))
+        except tk.TclError:
+            pass
+
+    def _on_header_resize(self, _e=None) -> None:
+        """窗口变宽变窄时重排那排芯片（延迟 150ms，别在拖拽中反复重建）。"""
+        if not self._remote_payload:
+            return
+        try:
+            if self._remote_job:
+                self.root.after_cancel(self._remote_job)
+        except Exception:
+            pass
+        self._remote_job = self.root.after(150, self._render_remote)
 
     def open_root_dir(self) -> None:
         root = core.ensure_layout(core.load_config())["root"]
@@ -2155,7 +2403,7 @@ class LauncherApp:
 
         wrap = tk.Frame(dlg, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
         wrap.pack(fill="both", expand=True, padx=18, pady=(4, 6))
-        scroll = ttk.Scrollbar(wrap, orient="vertical")
+        scroll = ui.MiniScrollbar(wrap, command=None, bg=CARD)
         box = tk.Listbox(wrap, bg=CARD, fg=TEXT, font=(FONT_MONO, 9), activestyle="none",
                          selectbackground=ACCENT, selectforeground="#FFFFFF",
                          highlightthickness=0, yscrollcommand=scroll.set)
@@ -2630,6 +2878,25 @@ def _safe_std_streams() -> None:
                 pass
 
 
+def _set_window_icon(root: tk.Tk) -> None:
+    """窗口标题栏 / 任务栏图标（`assets\\app.ico`）。
+
+    为什么还得单独设一次：PyInstaller 的 `--icon` 只换 **exe 文件本身**的图标
+    （资源管理器里看到的那个），窗口运行时用的是 Tk 默认的羽毛 —— 任务栏上就是一根羽毛。
+    图标放在 `assets\\`（源码目录和 exe 目录都认），没有就静默退回默认图标。
+    """
+    for base in (getattr(core, "SCRIPT_DIR", None), HERE):
+        if not base:
+            continue
+        ico = Path(base) / "assets" / "app.ico"
+        try:
+            if ico.exists():
+                root.iconbitmap(default=str(ico))
+                return
+        except Exception:
+            continue
+
+
 # 界面上的每个入口都必须真的挂在 LauncherApp 上。
 # 为什么专门查这个：缩进 / 注释写错时，一个 def 可能被"吃掉"变成上一个函数的**局部**函数，
 # 语法照样合法、窗口照样能建出来，只有点那个按钮时才炸（真的踩过一次：
@@ -2675,6 +2942,7 @@ def main() -> int:
     _safe_std_streams()
     enable_dpi_awareness()
     root = tk.Tk()
+    _set_window_icon(root)
     try:
         root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72.0)
     except Exception:

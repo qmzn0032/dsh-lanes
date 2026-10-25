@@ -1,7 +1,50 @@
 # 更新记录（CHANGELOG）
 
 版本号 = git tag。每个 tag 都指向一个能直接跑起来的源码状态（`py dsh_lanes.py --help` / `py dsh_lanes_gui.py`）。
-exe 不进仓库（`.gitignore` 排除了 `dist/`），要分享请把 `dist\*-onedir.zip` 挂到 Release 附件。
+exe 不进仓库（`.gitignore` 排除了 `dist/`、`_build/` 和 `*.exe`），要分享请把 `dist\*-onedir.zip`
+挂到 Release 附件。
+
+---
+
+## v0.3.0 — 2026-10-25
+
+### 界面：「大肥鱼化」
+
+**为什么重做**：原版界面是纯 `tk` 默认控件 —— 方块按钮、到处同色、没有层级；卡片和日志面板
+挤在一起，日志就是一块直接往里灌的 `Text`。这一版把外观换成一套自绘控件（品牌蓝 `#4D6BFE`），
+**功能一行没减**，改动集中在新增的 `ui_kit.py` 与 `dsh_lanes_gui.py`。
+
+- **`ui_kit.py`（新增）**：`RoundedButton`（4 变体 × 3 尺寸 × 3 态）/ `RoundedCard` /
+  `Pill` / `Chip` / `MiniScrollbar` / `divider()`，纯 `tkinter` + `math`，零第三方依赖。
+  刻意让 API 向 `tk.Button` 靠拢（`.pack()` / `.configure(text=…)` / `.cget("text")` / `.invoke()`），
+  所以把老的 `tk.Button` 换掉时，调用点一行都不用改。
+- **卡片**：`RoundedCard` + 悬停高亮 + **左侧状态色条** + 标题加大；版本号与 `★ 主要版本` 改芯片，
+  运行状态改状态胶囊。
+- **日志面板**：时间戳列 + 级别字形 + 小节留白 + 空状态 + 「自动滚动已暂停」提示 + 极简滚动条；
+  批量插入，上限 4000 行。
+- **顶栏**：三行文字压成两行，dist-tag 从一串字改成芯片，窄窗口自动少显示几个。
+- **底部**：蓝色文字链接改幽灵按钮，底部说明不再被挤成竖条。
+- **图标**：`assets/app.ico` 换成官方鲸鱼（从 dsh 前端自带的 `favicon.svg` 光栅化，
+  16/24/32/48/64/128/256 七档、透明底、品牌蓝），窗口标题栏与 exe 共用同一份。
+- **46 KB 轻量壳**：`tools/dsh_stub.cs` + `tools/build_stub.bat`。`/target:winexe` 的 C# 壳去找本机的
+  `pythonw.exe`（`DSH_LANES_PY` → `pyw.exe -3` → 注册表 `PythonCore\3.x\InstallPath` → PATH），
+  再拉起同目录的 `dsh_lanes_gui.py`。对比 PyInstaller 文件夹版（exe 2.3 MB + `_internal\` 22.3 MB）
+  小两个数量级，而且改完 `.py` 不用重新打包。
+
+### 顺手修掉的四个坑
+
+- **不弹黑窗口**：所有 `subprocess` 调用统一带 `creationflags=CREATE_NO_WINDOW`
+  （`_no_window()` / `_new_group_flags()`）。GUI 壳是 `pythonw`，但从它里面起的 `npm` / `node`
+  默认仍会闪一下控制台。
+- **受限令牌**：新增 `token_state()`（`IsTokenRestricted` + 进程完整性级别）。进程被关在受限沙箱里时，
+  写文件会报 `PermissionError [Errno 13]`、`taskkill` 也杀不掉别人的进程 —— 这**不是**目标目录的权限
+  问题（`icacls` 看着完全正常）。检测到受限时界面横幅直接点名，别让人跑去查 D 盘权限。
+- **日志文件被占用**：`open_log_append()` 先重试 → 换带时间戳的文件名 → 换目录
+  （程序目录 → `%LOCALAPPDATA%` → `%TEMP%`）→ 全都不行就不记日志，但**照常启动 lane**。
+- **端口被占但读不到 PID**：`probe_dsh_like()` 判断应答方像不像 dsh，像就直接接管，
+  不再白起一个 `node` 去撞 `EADDRINUSE`（退出码 1，界面上只显示"启动超时"）。
+
+细节见 [docs/界面美化.md](docs/界面美化.md)。
 
 ---
 

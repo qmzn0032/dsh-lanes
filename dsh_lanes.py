@@ -44,6 +44,7 @@ DSH 启动时会把 `$DSH_HOME/profiles/node_modules` 的模块回退链接重�
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ctypes
 import datetime
 import hashlib
@@ -444,7 +445,8 @@ def pid_alive(pid: int) -> bool:
 
 def kill_tree(pid: int) -> None:
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, creationflags=_no_window())
     else:
         try:
             os.kill(pid, 15)
@@ -659,6 +661,161 @@ def read_run(cfg: dict, lane: str) -> dict | None:
 _WRITE_WARNED: set[str] = set()
 
 
+def token_state() -> dict:
+    """当前进程的令牌状态：完整性级别 + 是不是**受限令牌**。
+
+    为什么需要它：受限令牌（restricted token）会把 `Authenticated Users`、`Users`
+    这些组直接从令牌里剔掉 —— ACL 上明明写着"允许修改"，写文件、结束进程却全被拒，
+    而 `icacls` / 文件属性 / 权限对话框里都看不出来。2026-10-25 那串
+    `Errno 13 Permission denied: 'D:\\dsh-lanes\\...'` 就是这么来的：
+    进程被关在沙箱（受限令牌）里，跟 D 盘权限无关。
+
+    返回 {"integrity": "Medium"/"High"/…, "restricted": True/False}
+    """
+    out: dict = {"integrity": "?", "restricted": False}
+    if os.name != "nt":
+        return out
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ad = ctypes.WinDLL("advapi32", use_last_error=True)
+        P = ctypes.c_void_p
+        k32.GetCurrentProcess.restype = P
+        k32.CloseHandle.argtypes = [P]
+        ad.OpenProcessToken.argtypes = [P, ctypes.c_uint32, ctypes.POINTER(P)]
+        ad.OpenProcessToken.restype = ctypes.c_int
+        ad.GetTokenInformation.argtypes = [P, ctypes.c_int, P, ctypes.c_uint32,
+                                           ctypes.POINTER(ctypes.c_uint32)]
+        ad.GetTokenInformation.restype = ctypes.c_int
+        ad.IsTokenRestricted.argtypes = [P]
+        ad.IsTokenRestricted.restype = ctypes.c_int
+        ad.GetSidSubAuthorityCount.argtypes = [P]
+        ad.GetSidSubAuthorityCount.restype = P
+        ad.GetSidSubAuthority.argtypes = [P, ctypes.c_uint32]
+        ad.GetSidSubAuthority.restype = P
+
+        TOKEN_QUERY = 0x0008
+        TokenIntegrityLevel = 25
+
+        h = P()
+        if not ad.OpenProcessToken(k32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(h)):
+            return out
+        try:
+            out["restricted"] = bool(ad.IsTokenRestricted(h))
+            need = ctypes.c_uint32(0)
+            ad.GetTokenInformation(h, TokenIntegrityLevel, None, 0, ctypes.byref(need))
+            buf = ctypes.create_string_buffer(max(int(need.value), 64))
+            if ad.GetTokenInformation(h, TokenIntegrityLevel, buf, need, ctypes.byref(need)):
+                sid = ctypes.cast(buf, ctypes.POINTER(P))[0]
+                pc = ad.GetSidSubAuthorityCount(sid)
+                count = ctypes.cast(pc, ctypes.POINTER(ctypes.c_ubyte))[0]
+                pr = ad.GetSidSubAuthority(sid, max(int(count) - 1, 0))
+                rid = ctypes.cast(pr, ctypes.POINTER(ctypes.c_uint32))[0]
+                out["integrity"] = {
+                    0x0000: "Untrusted", 0x0800: "Low", 0x1000: "Medium",
+                    0x2000: "High", 0x3000: "System",
+                }.get(rid, hex(rid))
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        pass
+    return out
+
+
+def _fallback_log_path(log: Path) -> Path:
+    """lane 根目录彻底不可写时的备用日志目录（程序目录 → 用户目录 → TEMP）。"""
+    cands = [app_dir() / "logs"]
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    cands.append(Path(base) / "DSH启动器" / "logs")
+    tmp = os.environ.get("TEMP")
+    if tmp:
+        cands.append(Path(tmp) / "DSH启动器" / "logs")
+    for d in cands:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            probe = d / f".probe-{os.getpid()}"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+            return d / log.name
+        except OSError:
+            continue
+    return Path(os.devnull)
+
+
+@contextlib.contextmanager
+def open_log_append(log: Path, tries: int = 6):
+    """追加方式打开日志。**打不开也不能挡住启动**：先重试，再换文件名，最后换目录。
+
+    2026-10-25 实测：`Errno 13 Permission denied: D:\\dsh-lanes\\logs\\global.log`
+    把「打开 lane」整条打断了，可那条 lane 本身能起来——日志只是观测手段，
+    不该成为硬依赖。日志被短暂占用（杀软实时扫描、上一次的 dsh 还没退干净、
+    用户正开着这个文件看）时，等一会儿再开通常就好了。
+
+    产出 `(文件对象, 实际写入的路径)`；文件对象为 None 表示本次不记日志。
+    """
+    try:
+        log.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
+    last = ""
+    for i in range(tries):
+        try:
+            fh = open(log, "a", encoding="utf-8", errors="replace")
+        except OSError as exc:
+            last = f"{type(exc).__name__}: {exc}"
+            if i < tries - 1:
+                time.sleep(0.2 * (i + 1))
+            continue
+        try:
+            yield fh, log
+        finally:
+            fh.close()
+        return
+
+    for cand in (
+        log.with_name(f"{log.stem}-{time.strftime('%Y%m%d-%H%M%S')}{log.suffix}"),
+        _fallback_log_path(log),
+    ):
+        try:
+            fh = open(cand, "a", encoding="utf-8", errors="replace")
+        except OSError as exc:
+            last = f"{type(exc).__name__}: {exc}"
+            continue
+        warn(f"日志 {log.name} 打不开（{last}），本次写到：{cand}")
+        try:
+            yield fh, cand
+        finally:
+            fh.close()
+        return
+
+    warn(f"日志 {log} 打不开（{last}）——本次不记日志，lane 照常启动")
+    yield None, log
+
+
+def probe_writable(root: Path) -> tuple[bool, str]:
+    """目录能不能写。重试 + 每次换唯一文件名，避免被上次遗留的只读探针文件骗了。"""
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+    last = ""
+    for i in range(3):
+        probe = root / f".write-test-{os.getpid()}-{i}"
+        try:
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return True, ""
+        except OSError as exc:
+            last = f"{type(exc).__name__}: {exc}"
+            try:
+                probe.unlink()
+            except OSError:
+                pass
+            time.sleep(0.15)
+    return False, last
+
+
 def lane_root_writable(cfg: dict) -> tuple[bool, str]:
     """lane 根目录能不能写。返回 (能不能写, 说明文字)。
 
@@ -666,14 +823,8 @@ def lane_root_writable(cfg: dict) -> tuple[bool, str]:
     只是"窗口下次打开不会记得这条 lane"，所以只提示，不拦。
     """
     root = Path(cfg.get("root") or "")
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-        probe = root / ".write-test"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
-        return True, str(root)
-    except OSError as exc:
-        return False, f"{root}（{exc}）"
+    good, why = probe_writable(root)
+    return good, (str(root) if good else f"{root}（{why}）")
 
 
 def write_run(cfg: dict, lane: str, data: dict) -> bool:
@@ -934,9 +1085,32 @@ def resolve_tag(packument: dict, spec: str) -> str:
 
 # ======================= 子进程：无管道执行（写日志 + 可选跟随） =======================
 
+# 「不要弹黑窗口」。
+# 为什么需要（2026-10-25）：pythonw / 打包成 --noconsole 的 exe 之后，**本进程自己没有控制台**。
+# 这时候再启动一个控制台子程序（node.exe / npm.cmd / taskkill / cmd），Windows 会给它
+# **新建一个黑窗口**——用户看到的就是"终端弹窗一闪"。
+# CREATE_NO_WINDOW(0x08000000) 让子进程照常跑：输出照旧进管道或日志文件、PID 照旧能 taskkill，
+# 只是不分配可见的 console。它跟 CREATE_NEW_PROCESS_GROUP 可以同时用。
+# 唯一例外是「升级」那条：那里**就是要**开一个终端窗口让用户看着 npm 装（launch_terminal_script），
+# 所以那条路走 os.startfile，不经过这里。
+NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def _no_window() -> int:
+    """给 subprocess.run / Popen 用的 creationflags。"""
+    return NO_WINDOW
+
 
 def _new_group_flags() -> int:
-    return subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    return flags | NO_WINDOW
+
+
+def _idle_thread() -> threading.Thread:
+    """占位线程：日志开不了、没法跟随文件时用它，省得每个 join 都要判 None。"""
+    t = threading.Thread(target=lambda: None, daemon=True)
+    t.start()
+    return t
 
 
 def follow_file(path: Path, stop: threading.Event, on_line=None, start_offset: int = 0) -> threading.Thread:
@@ -987,18 +1161,21 @@ def run_logged(cmd: list[str], cwd: Path, env: dict, log_path: Path, follow: boo
     log_path.parent.mkdir(parents=True, exist_ok=True)
     stop = threading.Event()
     thread = None
-    with open(log_path, "a", encoding="utf-8", errors="replace") as logf:
-        logf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} $ {' '.join(cmd)} (cwd={cwd})\n")
-        logf.flush()
-        offset = logf.tell()
-        if follow:
-            thread = follow_file(log_path, stop, start_offset=offset)
+    with open_log_append(log_path) as (logf, log_used):
+        if logf is None:
+            offset = 0
+        else:
+            logf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} $ {' '.join(cmd)} (cwd={cwd})\n")
+            logf.flush()
+            offset = logf.tell()
+            if follow:
+                thread = follow_file(log_used, stop, start_offset=offset)
         proc = subprocess.Popen(
             cmd,
             cwd=str(cwd),
             env=env,
             stdin=subprocess.DEVNULL,
-            stdout=logf,
+            stdout=(logf if logf is not None else subprocess.DEVNULL),
             stderr=subprocess.STDOUT,
             creationflags=_new_group_flags(),
         )
@@ -1500,7 +1677,8 @@ def cmd_doctor(cfg: dict, args) -> int:
     info(f"  node        : {node or '未找到'}")
     if node:
         try:
-            out = subprocess.run([node, "-v"], capture_output=True, text=True, timeout=20).stdout.strip()
+            out = subprocess.run([node, "-v"], capture_output=True, text=True, timeout=20,
+                                 creationflags=_no_window()).stdout.strip()
             ok(f"node 可执行（{out}）")
         except Exception as exc:
             fail(f"node 无法执行：{exc}")
@@ -1509,7 +1687,8 @@ def cmd_doctor(cfg: dict, args) -> int:
     if node and npm_cli:
         try:
             out = subprocess.run(
-                [node, npm_cli, "-v"], capture_output=True, text=True, timeout=30
+                [node, npm_cli, "-v"], capture_output=True, text=True, timeout=30,
+                creationflags=_no_window(),
             ).stdout.strip()
             ok(f"npm 可执行（{out}）")
         except Exception as exc:
@@ -1519,10 +1698,11 @@ def cmd_doctor(cfg: dict, args) -> int:
     info(f"  lane root   : {p['root']}")
     try:
         ensure_layout(cfg)
-        probe = p["root"] / ".write-test"
-        probe.write_text("ok", encoding="utf-8")
-        probe.unlink()
-        ok("lane root 可写")
+        good, why = probe_writable(p["root"])
+        if good:
+            ok("lane root 可写")
+        else:
+            fail(f"lane root 不可写：{p['root']}（{why}）")
     except Exception as exc:
         fail(f"lane root 不可写：{exc}")
     info(f"  默认工作区  : {cfg.get('default_cwd')}")
@@ -1711,6 +1891,16 @@ def cmd_open(cfg: dict, args) -> int:
             return 0
         fail(f"端口 {port} 已被占用（不是 DSH 实例）。换一个：--port 3083，或先停掉占用者。")
         return 1
+    if not holder and port_in_use(port) and probe_dsh_like(port):
+        # 端口上确实是一套 DSH，但拿不到它的 PID（受限令牌下 TCP 表可能读不出来）。
+        # 这时候硬起第二个进程必然 EADDRINUSE，只会得到一句没头没脑的"退出码 1"。
+        url = f"http://127.0.0.1:{port}"
+        info("")
+        warn(f"端口 {port} 上已经有一套 DSH 在跑（拿不到它的 PID）—— 直接用它，不再起第二个")
+        info(col(f"  {url}", C.BOLD + C.CYAN))
+        if cfg.get("open_browser", True) and not args.no_browser:
+            webbrowser.open(url)
+        return 0
     entry = lane_entry_script(cfg, lane)
     if not entry.is_file():
         fail(f"入口缺失：{entry}（建议重新 create，或用 adopt 指向正确的安装树）")
@@ -1745,18 +1935,22 @@ def cmd_open(cfg: dict, args) -> int:
             url_box["url"] = m.group(1).strip()
 
     stop = threading.Event()
-    log.parent.mkdir(parents=True, exist_ok=True)
-    with open(log, "a", encoding="utf-8", errors="replace") as logf:
-        logf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} $ {' '.join(cmd)} (cwd={cwd})\n")
-        logf.flush()
-        offset = logf.tell()  # 只认本次启动之后写的行（旧 token 不可用）
-        thread = follow_file(log, stop, on_line, start_offset=offset)
+    with open_log_append(log) as (logf, log_used):
+        if log_used != log:
+            info(col(f"      （日志实际写到：{log_used}）", C.GRAY))
+        if logf is None:
+            thread = _idle_thread()
+        else:
+            logf.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} $ {' '.join(cmd)} (cwd={cwd})\n")
+            logf.flush()
+            offset = logf.tell()  # 只认本次启动之后写的行（旧 token 不可用）
+            thread = follow_file(log_used, stop, on_line, start_offset=offset)
         proc = subprocess.Popen(
             cmd,
             cwd=str(cwd),
             env=env,
             stdin=subprocess.DEVNULL,
-            stdout=logf,
+            stdout=(logf if logf is not None else subprocess.DEVNULL),
             stderr=subprocess.STDOUT,
             creationflags=_new_group_flags(),
         )
@@ -2013,7 +2207,9 @@ def cmd_stop(cfg: dict, args) -> int:
             kill_tree(pid)
             time.sleep(0.6)
             if pid_alive(pid):
-                warn(f"lane「{lane}」进程 {pid} 仍存活，请手动检查")
+                warn(f"lane「{lane}」进程 {pid} 仍存活 —— 结束不掉它")
+                warn("     常见原因：① 我在受限沙箱里（令牌被裁剪）② 它是用管理员权限启动的")
+                warn(f"     手动结束：任务管理器 → 详细信息 → 找 PID {pid} → 结束任务")
             else:
                 ok(f"lane「{lane}」已停止")
             any_stopped = True
@@ -3533,6 +3729,7 @@ def run_dump_config(cfg: dict, lane: str, profile: str = PROFILE_NAME, timeout: 
                 env=env,
                 timeout=timeout,
                 cwd=str(cfg.get("default_cwd") or home),
+                creationflags=_no_window(),
             ).returncode
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "rc": -1, "error": f"{type(exc).__name__}: {exc}", "rows": {}, "unmatched": [], "skipped": []}
@@ -3863,7 +4060,7 @@ def judge_patch_yaml(cfg: dict, home, pkg_dir, path: Path, install_dir=None) -> 
         proc = subprocess.run(
             [node, "-e", YAML_JUDGE_JS],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=120, env=env,
+            timeout=120, env=env, creationflags=_no_window(),
         )
         payload = ""
         for line in reversed((proc.stdout or "").splitlines()):
@@ -5485,7 +5682,8 @@ def run_plugin_cmd(cfg: dict, lane: str, pnpm_args: list[str], timeout: int = 12
     try:
         with open(log_p, "w", encoding="utf-8") as fo, open(err_p, "w", encoding="utf-8") as fe:
             rc = subprocess.run(cmd, stdout=fo, stderr=fe, env=env, timeout=timeout,
-                                cwd=str(profile_dir(home, PROFILE_NAME))).returncode
+                                cwd=str(profile_dir(home, PROFILE_NAME)),
+                                creationflags=_no_window()).returncode
     except subprocess.TimeoutExpired:
         rc, error = -2, f"超过 {timeout} 秒还没结束（已终止）"
     except Exception as exc:  # noqa: BLE001
