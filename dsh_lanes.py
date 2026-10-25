@@ -2743,6 +2743,108 @@ def lane_upgrade_plan(cfg: dict, lane: str) -> dict:
     return {"mode": "external", "dir": idir, "why": f"{kind}（{idir}）"}
 
 
+# ---- 外部安装（默认路径那份）的升级：只铺命令，交给新终端 ----
+#
+# 为什么不能像副本那样就地 `npm install --prefix`：
+#   接管来的树在 `%APPDATA%\npm\node_modules\@deepseek-ai\dsh`，那是 **npm 自己的全局前缀**，
+#   入口 shim（`npm.cmd` / `dsh.cmd`）就在旁边一层。换它等于换你日常真正在用的那一套，
+#   而且失败时 npm 只会把半成品留在全局目录里——本工具既不该、也不方便替他擦屁股。
+# 为什么不能在本进程里 `subprocess` 跑 npm：
+#   ① 装两三分钟、输出几十行，用户最需要**当场看着**它滚；
+#   ② 本进程是 GUI 壳（pythonw），把 npm 输出接回日志面板只剩"攒完再看"；
+#   ③ 万一失败，留在他眼前的该是一段**能重放、能改版本号**的命令，不是我们的封装。
+# 所以：只写一个 .bat（内容是那条命令 + 退出码 + pause），再用 shell 在新窗口里打开它。
+
+def external_upgrade_plan(cfg: dict, lane: str, version: str,
+                          registry_choice: str | None = None) -> dict:
+    """外部安装的升级**计划**：算出该在终端里跑的那条命令（纯计算，不联网、不装）。
+
+    `registry_choice` 显式选源时才把 `--registry` 钉进命令；选 auto 就留给 npm 自己的配置
+    ——一条命令只有一个源，而本工具"先官方再镜像"的自动换源在单条终端命令里做不到。
+    """
+    plan = lane_upgrade_plan(cfg, lane)
+    spec = (version or "").strip()
+    if not spec:
+        raise ValueError("要写明目标版本（例如 0.2.0-rc.2 / latest）")
+    regs = registry_plan(cfg, registry_choice)
+    explicit = str(registry_choice or "").strip().lower() not in ("", "auto")
+    # 显式选源时 regs[0] 就是选的那个（后面跟的是本工具的失败退路，单条终端命令用不上）
+    reg_url = regs[0] if explicit else ""
+    command = f"npm install -g {PKG}@{spec}"
+    if reg_url:
+        command += f" --registry {reg_url}"
+    command += " --no-audit --no-fund"
+    notes = [
+        (f"下载源：{registry_label(reg_url)}（命令里钉死，不受 npm config 影响）" if reg_url
+         else "下载源：沿用你 npm 自己的配置（`npm config get registry`）；"
+              "要在命令里钉死源，就在对话框里选「官方源」或「镜像源」"),
+        "装完回启动器点「刷新」：接管型 lane 的版本号按安装树自愈，不用手改 lanes.json",
+    ]
+    if spec.lower() in ("latest", "next", "alpha"):
+        notes.append(f"dist-tag {spec} 由 npm 现场解析，装到哪一版看终端里它打印的结果")
+    return {
+        "lane": lane,
+        "version": spec,
+        "install_dir": str(plan["dir"]),
+        "command": command,
+        "registry": reg_url,
+        "notes": notes,
+    }
+
+
+def terminal_script_text(plan: dict) -> str:
+    """新终端要跑的那段 .bat（单独成函数，方便核对内容与顺序）。"""
+    return (
+        "@echo off\r\n"
+        f"title DSH upgrade {plan['lane']} -> {plan['version']}\r\n"
+        'cd /d "%USERPROFILE%"\r\n'
+        "echo.\r\n"
+        "echo   将执行：\r\n"
+        f"echo     {plan['command']}\r\n"
+        "echo.\r\n"
+        f"echo   安装树：{plan['install_dir']}\r\n"
+        "echo.\r\n"
+        f"{plan['command']}\r\n"
+        "echo.\r\n"
+        "echo   [exit code] %ERRORLEVEL%\r\n"
+        "echo   装完关掉这个窗口，回启动器点「刷新」。\r\n"
+        "pause\r\n"
+    )
+
+
+def launch_terminal_script(bat: Path) -> None:
+    """在新控制台窗口里跑一个 .bat。
+
+    为什么走文件而不是 `cmd /k "<命令>"`：命令里一旦出现带空格的全路径，
+    `cmd /k` 就要套两层引号，而 Python 的 list2cmdline 用的是**反斜杠转义**——
+    cmd 不认那个转义，会一起坏掉。写成文件后引号语义只有文件里那一层。
+    """
+    if os.name != "nt":
+        raise RuntimeError("「新开终端升级」只在 Windows 上有效")
+    os.startfile(str(bat))  # noqa: S606 —— 就是要让 shell 起一个独立窗口
+
+
+def run_external_upgrade_in_terminal(cfg: dict, lane: str, version: str,
+                                     registry_choice: str | None = None,
+                                     stop_first: bool = False) -> dict:
+    """把外部安装的升级铺到新终端里跑：本进程**不执行 npm**，只写脚本 + 开窗口。"""
+    plan = external_upgrade_plan(cfg, lane, version, registry_choice)
+    if stop_first:
+        cmd_stop(cfg, argparse.Namespace(target=[lane]))
+    p = ensure_layout(cfg)
+    safe = re.sub(r"[^0-9A-Za-z._-]+", "-", plan["version"]).strip("-") or "version"
+    bat = p["logs"] / f"upgrade-{lane}-{safe}-terminal.bat"
+    text = terminal_script_text(plan)
+    try:
+        bat.write_text(text, encoding="mbcs")
+    except (LookupError, UnicodeEncodeError):
+        # 非中文 Windows / 极端字符：退回 UTF-8 并让 cmd 自己切码页
+        bat.write_text("chcp 65001 >nul\r\n" + text, encoding="utf-8")
+    launch_terminal_script(bat)
+    plan["bat"] = str(bat)
+    return plan
+
+
 def npm_install_in_place(cfg: dict, tree: Path, version: str, follow: bool = True,
                          registries: list[str] | None = None) -> str:
     """在**已有的**安装树里就地换版本（`npm install --prefix <tree> <pkg>@<version>`）。
@@ -2808,13 +2910,41 @@ def cmd_upgrade(cfg: dict, args) -> int:
     info(f"  升级方式  : {plan['why']}")
 
     if plan["mode"] == "external":
-        fail(
-            f"「{lane}」的安装树在本启动器目录之外 —— 改它等于改你日常真正在用的那一套，"
-            "这一步有意不动它。"
+        # 外部安装（默认路径那份）：本工具不代为安装，只把命令铺到新终端里。
+        spec = (getattr(args, "version", None) or "").strip()
+        if getattr(args, "rollback", False):
+            fail("外部安装没有升级记录，不能 --rollback（它一直是你自己在升的）")
+            return 1
+        if not spec:
+            fail("要写明目标版本（例如 0.2.0-rc.2 / latest）")
+            return 1
+        try:
+            ext = external_upgrade_plan(cfg, lane, spec, getattr(args, "registry", None))
+        except ValueError as exc:
+            fail(str(exc))
+            return 1
+        if getattr(args, "dry_run", False):
+            info(col("  外部安装：本工具不执行安装；这条命令会交给新终端去跑：", C.BOLD))
+            info(f"    {ext['command']}")
+            info(f"    安装树  {ext['install_dir']}")
+            for note in ext["notes"]:
+                info(col(f"    · {note}", C.GRAY))
+            return 0
+        if not getattr(args, "in_terminal", False):
+            fail(f"「{lane}」的安装树在启动器目录之外（你日常真正在用的那一套）——本工具不代为安装。")
+            info(col("      加 --in-terminal 就会新开一个终端窗口，在里面跑下面这条命令：", C.GRAY))
+            info(col(f"        py {me} upgrade {lane} {spec} --in-terminal", C.CYAN))
+            info(col(f"      那条命令是： {ext['command']}", C.GRAY))
+            return 1
+        got = run_external_upgrade_in_terminal(
+            cfg, lane, spec, getattr(args, "registry", None),
+            stop_first=bool(getattr(args, "stop", False)),
         )
-        info(col("      要动它得单独一步：先停实例 → 换那一份安装 → 起回来 → 确认能退回。", C.GRAY))
-        info(col(f"      只想看状态： py {me} list / py {me} instances", C.CYAN))
-        return 1
+        ok(f"已新开一个终端窗口，在里面执行：{got['command']}")
+        info(col(f"      脚本  {got['bat']}", C.GRAY))
+        for note in got["notes"]:
+            info(col(f"      · {note}", C.GRAY))
+        return 0
 
     # 目标版本：--rollback 时取上次升级前记下的版本
     rollback = bool(getattr(args, "rollback", False))
@@ -6604,6 +6734,9 @@ def build_parser() -> argparse.ArgumentParser:
                            help="跳过「升完启动一次」的冒烟验证（默认会做，起不来就自动退回）")
     p_upgrade.add_argument("--dry-run", dest="dry_run", action="store_true",
                            help="只显示会做什么，不动任何东西")
+    p_upgrade.add_argument("--in-terminal", dest="in_terminal", action="store_true",
+                           help="外部安装（默认路径那份）不代装：新开一个终端窗口，"
+                                "在里面跑 npm install -g …（本工具只铺命令）")
     p_upgrade.add_argument("--registry", metavar="auto|official|mirror|URL",
                            help="从哪个 npm 源查版本并下载（默认沿用 lanes.json；"
                                 "查和装一定用同一个源，缺依赖自动换另一个源重试）")

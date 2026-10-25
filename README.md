@@ -108,6 +108,9 @@ exe 没签名，首次运行 Windows SmartScreen 可能拦一下：点「更多�
 - lane 的安装树（创建 / 升级 / 复制 / 删除）
 - lane 的 `DSH_HOME`（复制过来的 API key、对话恢复、运行态文件 `<root>\run\<lane>.json`、备份目录 `<root>\backups\`）
 - 「插件市场」单独开关（`market-off` / `market-on`）会往对应 profile 的补丁层里写一段**带起止标记**的块，用 `market-on` 可整段撤销——其它插件一个都不碰
+- 升级**默认路径那份**（接管来的外部安装）时只写一个终端脚本
+  `<root>\logs\upgrade-<lane>-<版本>-terminal.bat`，然后在新窗口里打开它；
+  npm 由那个窗口执行，**本进程一行 npm 都不跑**（见第 8 节）
 
 **它不做的事**：不碰 dsh 自己的源代码；不做通用插件开关（在真实 profile 上写坏过一次，已停用，
 要用插件开关请去 dsh 自己的插件市场页面）；不给"这次升级安不安全"的判断结论。
@@ -135,6 +138,8 @@ py dsh_lanes.py delete <lane> [--stop] [--keep-home] [--keep-install] [--home-to
 py dsh_lanes.py clone <源 lane> <新 lane> [--port N] [--no-inherit]
 py dsh_lanes.py upgrade <lane> <版本|tag> [--stop] [--dry-run] [--no-boot-check]
                                           [--registry auto|official|mirror]
+py dsh_lanes.py upgrade <lane> <版本|tag> --in-terminal
+                                          外部安装（默认路径那份）：新开终端跑 npm i -g
 py dsh_lanes.py upgrade <lane> --rollback
 py dsh_lanes.py verify <lane> [--fix]
 py dsh_lanes.py plugins <lane> [--dump]   插件清单（只读）
@@ -228,7 +233,15 @@ py dsh_lanes.py chat-sync <目标 lane> --from next  # 换源
 - **不给"升级安不安全"的结论。** 工具只能按预设逻辑工作；组合树、插件 peer 闸门这些是宿主内部事实，
   宿主一变，工具输出的"安全/不安全"就是拿过期规则替你决定，比不给更危险。
   它只做确凿能验证的部分：装没装上、起没起来（HTTP 200 + cookie 握手）、文件指纹对不对、能不能退回。
-- **接管来的外部安装（npm 全局那一份）不参与 `upgrade`**：那等于直接改你正在用的那一份。
+- **接管来的外部安装（npm 全局那一份）不在本进程里升级。** 那棵树在你的全局前缀里
+  （`%APPDATA%\npm\node_modules\@deepseek-ai\dsh`），装它等于改你日常真正在用的那一套，
+  npm 覆盖时还会连带动旁边的入口 shim。所以这条路改成了「只铺命令」：
+  GUI 上点「在终端里升级」，CLI 加 `--in-terminal` —— 工具把
+  `npm install -g @deepseek-ai/dsh@<版本>` 写成一个 `.bat`（落在 `<root>\logs\`），
+  在新控制台窗口里打开它，**npm 由那个窗口跑**，进度和报错都在你眼前。
+  装完回启动器点「刷新」：接管型 lane 的版本号按安装树自愈，不用手改 `lanes.json`。
+  它正在运行时默认**先停掉它再开终端**（node 占着的文件 npm 覆盖不了），对话框里的勾选框
+  可以关掉这个行为；装完从卡片上重新打开即可。
 - **不做通用插件开关**（理由见第 5 节）。
 - **三条 lane 的对话记忆不互通**：会话文件按版本隔离；跨版本要"记得"的东西应该放在记忆层
   （比如一个跨会话的记忆插件 / 记忆库），而不是会话文件层——会话格式在版本之间会变代际，
@@ -301,7 +314,15 @@ build_exe.bat                      :: 双击也行
 
 ## 11. 更新记录
 
-见 [CHANGELOG.md](CHANGELOG.md)。当前版本 **v0.2.2**（2026-10-13）：
+见 [CHANGELOG.md](CHANGELOG.md)。当前版本 **v0.2.3**（2026-10-24）：
+
+- 「默认路径那份」也能升级了：GUI 的升级对话框里多了「在终端里升级」，
+  CLI 是新旗标 `upgrade <lane> <版本> --in-terminal`；工具只把
+  `npm install -g …` 写成脚本并在**新终端**里打开，npm 不在启动器进程里跑。
+- 外部安装的版本列表里，"已装"标记改按**它自己那棵树**核对（以前错看启动器的
+  `versions\` 目录，所以从不显示）。
+
+上一版 **v0.2.2**（2026-10-13）：
 
 - 新建 / 复制可以选择「不继承密钥和设置」（`--no-inherit`）—— 不带 API key、匿名身份、
   DSH 设置与 agent 预设，插件、插件数据、对话照旧复制；

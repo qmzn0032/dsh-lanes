@@ -1705,10 +1705,11 @@ class LauncherApp:
         core.sync_lane_versions(cfg)      # 「当前版本」必须是安装树里的事实，不是旧台账
         data = (cfg.get("lanes") or {}).get(lane) or {}
         plan = core.lane_upgrade_plan(cfg, lane)
+        external = plan["mode"] == "external"
         running = core.lane_runtime(cfg, lane)
 
         dlg = tk.Toplevel(self.root)
-        dlg.title("升级版本")
+        dlg.title("升级默认路径的 DSH" if external else "升级版本")
         dlg.configure(bg=BG)
         dlg.transient(self.root)
         w, h = 700, 640
@@ -1733,12 +1734,12 @@ class LauncherApp:
         note = tk.Label(dlg, text="", bg=BG, fg=AMBER, font=(FONT_UI, 9), justify="left",
                         anchor="w", wraplength=650)
         note.pack(anchor="w", padx=18, pady=(6, 0))
-        external = plan["mode"] == "external"
         if external:
             note.configure(
-                text="这条 lane 的安装树在本启动器目录之外（你日常真正在用的那一套）——"
-                     "这个窗口有意不动它。要动它得单独一步、单独确认。",
-                fg=RED,
+                text="这条 lane 的安装树在启动器目录之外（你日常真正在用的那一套）。"
+                     "本窗口不会替你装：点下面「在终端里升级」会新开一个终端窗口，"
+                     "把那条 npm 命令交给你看着跑完——本工具只铺命令、不执行安装。",
+                fg=AMBER,
             )
 
         reg_var, reg_remember = self.registry_row(dlg, cfg, pady=(12, 0))
@@ -1757,6 +1758,20 @@ class LauncherApp:
         entry.pack(side="left", padx=(8, 0))
         hint = tk.Label(row, text="", bg=BG, fg=GRAY, font=(FONT_UI, 9))
         hint.pack(side="left", padx=(10, 0))
+
+        stop_first = tk.BooleanVar(value=True)
+        if external and running:
+            # npm 覆盖全局目录时，正在被 node 打开的文件在 Windows 上改不动（EPERM/EBUSY），
+            # 先停更省事：装完他从卡片上重新打开即可。
+            chk = tk.Frame(dlg, bg=BG)
+            chk.pack(fill="x", padx=18, pady=(8, 0))
+            tk.Checkbutton(
+                chk,
+                text="先停掉它再开终端（推荐：运行中的 node 占着文件，npm 覆盖会失败）",
+                variable=stop_first, bg=BG, fg=TEXT, font=(FONT_UI, 9),
+                selectcolor=CARD, activebackground=BG, activeforeground=TEXT,
+                highlightthickness=0, bd=0, anchor="w",
+            ).pack(anchor="w")
 
         foot = tk.Frame(dlg, bg=BG)
         foot.pack(fill="x", padx=18, pady=(8, 14))
@@ -1809,6 +1824,36 @@ class LauncherApp:
             dlg.destroy()
             self.run_job(title, lambda: core.cmd_upgrade(core.load_config(), args))
 
+        def start_external() -> None:
+            """外部安装（默认路径那份）：开一个新终端跑 npm，本进程不装。"""
+            version = var.get().strip()
+            if not version:
+                messagebox.showinfo("先填版本号",
+                                    "在上面挑一版或手打一个版本号（例如 0.2.0-rc.2 / latest）。",
+                                    parent=dlg)
+                return
+            try:
+                ext = core.external_upgrade_plan(cfg, lane, version, reg_var.get())
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("算不出升级命令", f"{type(exc).__name__}: {exc}", parent=dlg)
+                return
+            want_stop = bool(external and running and stop_first.get())
+            stop_line = f"· 先停掉「{lane}」，装完请从卡片上重新打开\n" if want_stop else ""
+            if not messagebox.askyesno(
+                "在终端里升级",
+                f"会新开一个终端窗口，在里面执行：\n\n{ext['command']}\n\n"
+                f"· 装到：{ext['install_dir']}\n"
+                + stop_line
+                + "· 本工具不执行安装，只在新窗口里把那条命令跑起来\n"
+                  "· 装完回这里点「刷新」（F5），版本号会按安装树自动更正\n\n继续？",
+                parent=dlg,
+            ):
+                return
+            self._save_registry_choice(reg_var, reg_remember)
+            if self.upgrade_in_terminal(lane, version, reg_var.get(), want_stop):
+                dlg.destroy()
+                self.refresh_lanes(force=True)
+
         self.link_button(foot, "关闭", dlg.destroy, fg=MUTED).pack(side="right")
         self.link_button(foot, "先看会做什么", lambda: start(False, dry_run=True),
                          fg=ACCENT_DK).pack(side="right", padx=(0, 14))
@@ -1820,8 +1865,10 @@ class LauncherApp:
             up = self.link_button(foot, "升级到这一版", lambda: start(False), fg=ACCENT_DK)
             up.pack(side="right", padx=(0, 14))
         else:
-            tk.Label(foot, text="外部安装：本窗口不动它", bg=BG, fg=RED,
-                     font=(FONT_UI, 9)).pack(side="right", padx=(0, 14))
+            # 外部安装这条例外：本进程不装，只把命令铺到新终端里（见 core 的注释）。
+            self.link_button(foot, "在终端里升级", start_external, fg=ACCENT_DK).pack(
+                side="right", padx=(0, 14)
+            )
 
         def load(choice: str) -> None:
             try:
@@ -1849,7 +1896,12 @@ class LauncherApp:
                     if ver == current:
                         marks.append("现在用的")
                     try:
-                        if core.installed_version(core.paths(cfg)["versions"] / ver) == ver:
+                        # 外部安装的树是"dsh 包目录"本身，不是 `<前缀>/versions/<版本>`：
+                        # 拿本启动器的 versions 目录去核对会把"本地已装"标错。
+                        if external:
+                            if core.package_version_at(Path(plan["dir"])) == ver:
+                                marks.append("已是这一版")
+                        elif core.installed_version(core.paths(cfg)["versions"] / ver) == ver:
                             marks.append("本地已装")
                     except Exception:  # noqa: BLE001
                         pass
@@ -1880,6 +1932,33 @@ class LauncherApp:
         reg_var.trace_add("write", reload)
         reload()
 
+
+    def upgrade_in_terminal(self, lane: str, version: str, registry: str,
+                            stop_first: bool) -> str | None:
+        """外部安装（默认路径那份）升级：新开一个终端跑 npm，**本进程不装**。
+
+        为什么不在本进程里 `subprocess` 跑：npm 要装两三分钟、输出几十行，那些东西
+        他得当场看着；而 GUI 壳只能把输出攒进日志面板。失败的现场留在终端里，
+        他还能照着改版本号重跑。本函数只负责铺脚本 + 开窗口。
+        返回终端脚本路径；失败返回 None（已弹框说明）。
+        """
+        try:
+            got = core.run_external_upgrade_in_terminal(
+                core.load_config(), lane, version, registry, stop_first=stop_first
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("没开成终端", f"{type(exc).__name__}: {exc}", parent=self.root)
+            return None
+        self.log(f"已新开终端，在里面执行：{got['command']}", "ok")
+        self.log(f"脚本：{got['bat']}", "muted")
+        if stop_first:
+            self._invalidate()
+        messagebox.showinfo(
+            "已在新终端里升级",
+            f"{got['command']}\n\n装完回到启动器点「刷新」（F5），版本号会按安装树自动更正。",
+            parent=self.root,
+        )
+        return got["bat"]
 
     def market_dialog(self, lane: str) -> None:
         """插件市场单独开关 + 更新。
@@ -2569,6 +2648,7 @@ _REQUIRED_ACTIONS = (
     "delete_lane",
     "clone_lane",
     "upgrade_dialog",
+    "upgrade_in_terminal",
     "verify_lane",
     "market_dialog",
     "chat_dialog",
