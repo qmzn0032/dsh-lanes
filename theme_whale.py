@@ -89,30 +89,31 @@ def contrast(a: str, b: str) -> float:
 # 两边关系一致，切换时才是"同一片海换了个天色"，而不是两套皮肤。
 _RAW = {
     "light": {
-        "brand":     "#2F5BE0",
-        "bg_base":   "#DCEAF9",
-        "layer1":    "#FDFEFF",
-        "layer2":    "#EDF4FD",
+        "brand":     "#3B62F6",
+        "bg_base":   "#E4EFFB",
+        "layer1":    "#FBFDFF",
+        "layer2":    "#E9F2FC",
         "overlay":   "#FFFFFF",
-        "line1":     "#C2D8EE",
-        "line2":     "#97B8DC",
-        "label1":    "#0C2040",
-        "label2":    "#3F608A",
+        "line1":     "#CFE1F3",
+        "line2":     "#A6C4E4",
+        "label1":    "#0E2340",
+        "label2":    "#46678F",
         "success":   "#1F9D72",
         "warn":      "#B97A1E",
         "error":     "#D6456D",
         "sidebar":   "#DCE9F8",
         "on_brand":  "#FFFFFF",
-        "shadow":    "#123A6B",
+        "shadow":    "#12386C",
         # 海水：上浅下深 + 四周压深，最深的是窗边那一圈。
-        # v0.3.5 整体压深一档、加一点饱和：原来 water_* 太淡，和卡片只差 4% 亮度，
-        # 整窗读起来是"白卡片浮在雾里"——蓝色既不像水也不像底，就成了"割裂"。
-        # 另外 line1(卡片描边) 原来和 water_bottom 是**同一个值**，描边落进海里看不见。
-        "water_top":    "#D2E5F9",
-        "water_bottom": "#AECDEB",
-        "water_edge":   "#88AFD8",
-        "vignette":     0.58,
-        "glow":         (0.22, 0.20, 0.12),   # 三处光斑强度，对齐 GLOW 的顺序
+        # v0.3.6 退回 v0.3.4 的这套值。v0.3.5 曾经整体压深一档（想解决"白卡片浮在雾里"），
+        # 结果太重、蓝色抢戏 —— 你要的是"淡淡的、干净的"，不是"更蓝"。所以别再往上调。
+        # 代价是 line1 和 water_bottom 是同一个值：贴着海的卡片描边看不见。
+        # 这是**故意**的（卡片像浮着、不像贴上去的），别当成 bug 再去调深。
+        "water_top":    "#E0ECFA",
+        "water_bottom": "#CFE1F4",
+        "water_edge":   "#B7CDE4",
+        "vignette":     0.55,
+        "glow":         (0.20, 0.18, 0.10),   # 三处光斑强度，对齐 GLOW 的顺序
     },
     "dark": {
         "brand":     "#6C8CFF",
@@ -298,10 +299,10 @@ def check_contrast(verbose: bool = True) -> list:
             ("layer1 比 water_top 亮（卡片浮起）", t.layer1, t.water_top, 1.08, True),
             ("layer1 比 海水最亮处 亮（光斑不压卡片）", t.layer1, _ocean_brightest(t), 1.06, True),
             ("water_edge 比 layer1 暗（窗边是深水）", t.layer1, t.water_edge, 1.10, True),
-            # 卡片描边要能从海水里分出来：v0.3.4 的 line1 和 water_bottom 是同一个
-            # 色值，贴着海的卡片边缘等于没有边，白卡片像直接裁出来贴在蓝底上的。
-            # 这条只要"分得开"，不规定谁上谁下（浅海里描边比水亮，深海里也是）。
-            ("line1 与 water_bottom 可区分（描边不落进海里）", t.line1, t.water_bottom, 1.10, None),
+            # 曾经还有第 4 条「line1 与 water_bottom 可区分（描边不落进海里）」。
+            # v0.3.6 撤掉了：它和"浅海要柔和"是互相打架的 —— 浅海这套值里
+            # line1 和 water_bottom 本来就是同一个色（描边融进海里、卡片像浮着），
+            # 这正是你要的效果。留着这条会一直报红，等于把偏好当成 bug。
         ):
             c = contrast(fg, col)
             ok = c >= need

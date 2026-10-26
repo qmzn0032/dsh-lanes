@@ -152,8 +152,19 @@ def set_dark_titlebar(root: tk.Tk, dark: bool) -> None:
         pass
 
 
+# RedrawWindow 的标志位（winuser.h）。抽成常量是为了能被测试读到。
+# 只用 INVALIDATE|ALLCHILDREN，**绝不带 ERASE，也不带 UPDATENOW**：
+#   · ERASE = 先把那块区域擦成窗口类的底色，再让控件画内容。擦和画之间的那一帧
+#     就是用户眼里的"闪"。文档写得很直白：RDW_ERASE 会让窗口先收到 WM_ERASEBKGND。
+#   · UPDATENOW = 在我们的滚动处理里当场同步画完。屏幕上一半是挪过的、一半是旧的，
+#     一次滚动擦十几次，看着就是一格一格地抖。
+# 只要标记"这块脏了"，Windows 会在本轮消息处理完之后合并成一次 WM_PAINT。
+_RDW_INVALIDATE, _RDW_ERASE, _RDW_ALLCHILDREN, _RDW_UPDATENOW = 0x0001, 0x0004, 0x0080, 0x0100
+_REDRAW_FLAGS = _RDW_INVALIDATE | _RDW_ALLCHILDREN
+
+
 def redraw_windows(*widgets) -> None:
-    """让 Windows 立刻重画这些控件（含子控件，同步完成）。
+    """把 Windows 上这些控件（含子控件）标记成"脏"，让它们重新画一遍。
 
     为什么非有它不可：左列是个 Canvas，lane 卡片是 canvas 上的「窗口项」——
     在 Windows 上那是一个**真的子窗口**。滚轮滚动时 Tk 用 ScrollWindowEx 搬像素，
@@ -161,8 +172,9 @@ def redraw_windows(*widgets) -> None:
     白底和卡片里的文字/按钮全都不见了。用户看到的就是"滚一下，渲染丢了"。
     （X11 上不会：那边没有真子窗口，都是父窗口画的。）
 
-    修法只有一条：滚动之后按窗口句柄强制 RedrawWindow 一次。参数用
-    INVALIDATE|ERASE|ALLCHILDREN|UPDATENOW —— 同步重画，不会闪一下白。
+    为什么只是"标记脏"、不当场画：当场画（RDW_UPDATENOW）会把一次滚动拆成十几次
+    同步重画，每次还先擦一遍底色 —— 那就是"一闪一闪"。标记脏之后 Windows 自己
+    会把这一轮的所有脏区域合并成一次 WM_PAINT，中间没有"擦完还没画"的那一帧。
     纯外观兜底，任何失败都吞掉，不影响功能。
     """
     if os.name != "nt":
@@ -171,7 +183,7 @@ def redraw_windows(*widgets) -> None:
         user32 = ctypes.windll.user32
     except Exception:
         return
-    flags = 0x0001 | 0x0004 | 0x0080 | 0x0100   # INVALIDATE | ERASE | ALLCHILDREN | UPDATENOW
+    flags = _REDRAW_FLAGS
     for widget in widgets:
         try:
             hwnd = int(widget.winfo_id())
@@ -461,8 +473,7 @@ class LauncherApp:
         self._list_size = (0, 0)
         self._heal_at = 0.0           # 上一次"卡片补画"写日志的时间（防刷屏）
         self._wheel_acc = 0           # 滚轮增量累积（高精度滚轮一格只报 30~40）
-        self._redraw_job = None       # 滚动后强制重画的 idle 任务（见 redraw_windows）
-        self._redraw_tries = 0
+        self._redraw_job = None       # 滚动后标记重画的 idle 任务（见 redraw_windows）
 
         root.title("DSH 多版本启动器")
         root.configure(bg=BG)
@@ -969,38 +980,23 @@ class LauncherApp:
         self._schedule_list_redraw()
 
     def _schedule_list_redraw(self) -> None:
-        """排一次「强制重画左列」。会连排几次（30/90/180ms）。
+        """排一次「把左列标记成脏」。重复排会合并，只留最后一次（40ms 后）。
 
-        为什么不用 after_idle：Tk 把 canvas 上的窗口项挪位置**也是排到 idle** 里做的，
-        after_idle 排进去比它早，就成了"先补画、后挪窗口"，补了个寂寞。
-        为什么连排几次：左列改高度 → 卡片重排 → 里面折行又变 → 再改高度……
-        这个收敛过程要一两轮，只补一次很容易补在中间。多补两次都是几毫秒的
-        RedrawWindow，比"卡片白了只能重启"便宜太多。
+        v0.3.5 这里是"30/90/180ms 连补三次"，理由是重排要一两轮才收敛。
+        结果是：滚一格轮子擦三遍，界面看上去在打摆子。现在补画本身是免费的
+        （只标记脏，不擦不画），所以没必要连补 —— 一次标记就够，Windows 自己会
+        把这一轮所有的脏区域合并。真要收敛不完，卡片自检（_heal_cards）会兜底。
         """
         if self._redraw_job is not None:
             try:
                 self.root.after_cancel(self._redraw_job)
             except Exception:
                 pass
-        self._redraw_tries = 3
-        self._redraw_job = self.root.after(30, self._repaint_list_after_scroll)
+        self._redraw_job = self.root.after(40, self._repaint_list_after_scroll)
 
     def _repaint_list_after_scroll(self) -> None:
         self._redraw_job = None
-        try:
-            self.canvas.update_idletasks()      # 先把 Tk 欠着的挪窗口/重排做完
-        except tk.TclError:
-            return
-        try:
-            kids = [c for c in self.list_frame.winfo_children()
-                    if isinstance(c, ui.RoundedCard) and c.winfo_ismapped()]
-        except tk.TclError:
-            return
-        redraw_windows(self.list_frame, *kids)
-        if self._redraw_tries > 1:
-            self._redraw_tries -= 1
-            self._redraw_job = self.root.after(
-                (3 - self._redraw_tries) * 60, self._repaint_list_after_scroll)
+        self._repaint_list_now()
 
     def _align_ocean_cards(self) -> None:
         self._align_job = None
@@ -1011,7 +1007,8 @@ class LauncherApp:
         for child in kids:
             if isinstance(child, ui.RoundedCard) and child._ocean:
                 try:
-                    if child.winfo_ismapped():
+                    # 同 _heal_cards：滚动后 ismapped 不可信，按尺寸判断
+                    if child.winfo_width() >= 4 and child.winfo_height() >= 4:
                         child.heal()
                 except tk.TclError:
                     continue
@@ -1194,7 +1191,9 @@ class LauncherApp:
                 self._wheel_acc = 0          # 到底/到顶，别攒着等会儿一下子跳
                 return "break"
             self.canvas.yview_scroll(-steps, "units")
-            # 立刻补画：Windows 上滚动是"搬像素"，卡片是真子窗口，搬完不会自己重画
+            # 把左列标成脏（只标记，不擦不画）：Windows 上滚动是"搬像素"，
+            # 卡片是真子窗口，搬完不会自己重画。标记一次几微秒，本轮消息处理完
+            # 之后由 Windows 合并成一次 WM_PAINT —— 既不会白，也不会闪。
             self._repaint_list_now()
         except tk.TclError:
             pass
@@ -1209,21 +1208,19 @@ class LauncherApp:
         self._repaint_list_now()
 
     def _repaint_list_now(self) -> None:
-        """立刻补画左列（同步）。
+        """把左列（连同里面的卡片）标记成脏，Windows 会合并成一次重画。
 
-        关键是要先 `update_idletasks()`：Tk 把 canvas 上的窗口项挪位置是排到 idle 的，
-        不先把它推完就补画，补的是"挪之前"的位置 —— 等于没补，屏幕上还是空白。
+        只标 list_frame 一张就够：ALLCHILDREN 会递归到里面每一个卡片子窗口。
+
+        为什么不再 update_idletasks()：那是 v0.3.5"当场同步画"的必需品 ——
+        Tk 把窗口项挪位置排在 idle 里，不先推完，同步补画补的是挪之前的位置。
+        现在不急着自己画了：等真正的 WM_PAINT 到来时，Tk 早就把窗口挪好了，
+        顺带还把这一轮十几次滚动合并成一次画（这才是"不闪"的关键）。
         """
         try:
-            self.canvas.update_idletasks()
+            redraw_windows(self.list_frame)
         except tk.TclError:
-            return
-        try:
-            kids = [c for c in self.list_frame.winfo_children()
-                    if isinstance(c, ui.RoundedCard) and c.winfo_ismapped()]
-        except tk.TclError:
-            return
-        redraw_windows(self.list_frame, *kids)
+            pass
 
     # ── 日志 ────────────────────────────────────────────────────────────────
     def _tag_for(self, text: str, tag: str | None = None) -> str:
@@ -1688,7 +1685,10 @@ class LauncherApp:
             if not isinstance(child, ui.RoundedCard):
                 continue
             try:
-                if not child.winfo_ismapped():
+                # 不能用 winfo_ismapped()：canvas 上的窗口项一旦被滚出可视区，Tk 就把
+                # 它标成"未映射"（滚回来才恢复）。自检最需要干活的时刻恰好是"刚滚过"，
+                # 用 ismapped 等于在这个场景里整队跳过 —— 白卡片就永远没人补。
+                if child.winfo_width() < 4 or child.winfo_height() < 4:
                     continue
                 # 已经排着 60ms 后要重画的，就别插一脚：插进去会和那边互相取消，
                 # 变成"永远在补画"（每 2.5 秒重画一轮，白烧 CPU 还可能闪）。
