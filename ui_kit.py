@@ -447,7 +447,7 @@ class RoundedCard(tk.Canvas):
                  border_hover: str | None = None, border_width: int = 1,
                  radius: int = RAD["md"], padx: int = SP["lg"], pady: int = SP["md"],
                  owner_bg: str | None = None, fill: bool = False, rail: str | None = None,
-                 rail_w: int = 3, shadow: str | None = "s1", **kw) -> None:
+                 rail_w: int = 3, shadow: str | None = "s1", ocean: bool = False, **kw) -> None:
         t = theme()
         self._t = t
         self._bg = bg or t.layer1
@@ -461,9 +461,11 @@ class RoundedCard(tk.Canvas):
         self._rail = rail
         self._rail_w = rail_w
         self._shadow = shadow
+        self._ocean = ocean
         self._h = 0
         self._hover = False
         self._refs: list = []
+        self._ocean_refs: list = []
         self._resize_job = None
         super().__init__(master, bg=self._owner_bg, highlightthickness=0, bd=0, **kw)
         self.inner = tk.Frame(self, bg=self._bg)
@@ -529,18 +531,32 @@ class RoundedCard(tk.Canvas):
         shadow = "s2" if (self._shadow and self._hover) else self._shadow
         self.delete("frame")
         self.delete("rail")
+        self.delete("oceanbg")
+        self._refs = []
+        if self._ocean:
+            # 垫一层"真海面"：卡片圆角外面那圈缺口露的就是它，否则会露出纯色底，
+            # 在铺满整窗的渐变上就是四个色块缺口。
+            photo = ocean_slice(self, w, h)
+            if photo is not None:
+                self._ocean_refs = [self.create_image(0, 0, image=photo, anchor="nw",
+                                                     tags="oceanbg"), photo]
+                self.tag_lower("oceanbg")
         self._refs = round_box(self, bw, bw, w - bw, h - bw, self._r,
                                fill=self._bg, outline=line, width=bw,
                                shadow=shadow, tags="frame")
         self.tag_lower("frame")
-        if self._rail:
-            x0 = bw + 4
-            y0 = self._r * 0.5
-            y1 = h - self._r * 0.5
-            if y1 - y0 > self._rail_w * 2:
-                round_box(self, x0, y0, x0 + self._rail_w, y1, self._rail_w / 2,
-                          fill=self._rail, outline="", width=0, tags="rail")
-                self.tag_raise("rail")
+        self._paint_rail(w, h, bw)
+
+    def _paint_rail(self, w: int, h: int, bw: int) -> None:
+        if not self._rail:
+            return
+        x0 = bw + 4
+        y0 = self._r * 0.5
+        y1 = h - self._r * 0.5
+        if y1 - y0 > self._rail_w * 2:
+            round_box(self, x0, y0, x0 + self._rail_w, y1, self._rail_w / 2,
+                      fill=self._rail, outline="", width=0, tags="rail")
+            self.tag_raise("rail")
 
 
 # ── 状态胶囊 ────────────────────────────────────────────────────────────────
@@ -688,12 +704,15 @@ class MiniScrollbar(tk.Canvas):
     内容装得下时不画滑块；悬停加深；支持拖动与点槽翻页。
     """
 
-    def __init__(self, master, command=None, bg: str | None = None, width: int = 12, **kw) -> None:
+    def __init__(self, master, command=None, bg: str | None = None, width: int = 12,
+                 ocean: bool = False, **kw) -> None:
         self._t = theme()
         self._cmd = command
         self._first, self._last = 0.0, 1.0
         self._owner_bg = bg or _parent_bg(master)
         self._hover = False
+        self._ocean = ocean          # 底下是海面时垫一张切片，别留一条纯色带
+        self._ocean_refs: list = []
         self._grab_off: float | None = None
         super().__init__(master, width=width, bg=self._owner_bg,
                          highlightthickness=0, bd=0, **kw)
@@ -741,6 +760,10 @@ class MiniScrollbar(tk.Canvas):
         w, h = int(self.winfo_width()), int(self.winfo_height())
         if w < 6 or h < 24:
             return
+        if self._ocean:
+            photo = ocean_slice(self, w, h)
+            if photo is not None:
+                self._ocean_refs = [self.create_image(0, 0, image=photo, anchor="nw"), photo]
         if self._last - self._first >= 0.999:
             return
         y0, y1 = self._thumb()
@@ -800,6 +823,8 @@ class MiniScrollbar(tk.Canvas):
 
 # ── 海面背景 ────────────────────────────────────────────────────────────────
 _BG_CACHE: dict = {}
+_SLICE_CACHE: dict = {}
+_CROP_CACHE: dict = {}
 _CACHE_ROOT = None
 
 
@@ -815,6 +840,8 @@ def _ensure_root() -> None:
     if root is not _CACHE_ROOT:
         _CACHE.clear()
         _BG_CACHE.clear()
+        _SLICE_CACHE.clear()
+        _CROP_CACHE.clear()
         _FONTS.clear()
         _CACHE_ROOT = root
 
@@ -823,6 +850,8 @@ def clear_cache() -> None:
     """手动清空渲染缓存（换主题、改缩放时都可调）。"""
     _CACHE.clear()
     _BG_CACHE.clear()
+    _SLICE_CACHE.clear()
+    _CROP_CACHE.clear()
     _FONTS.clear()
 
 
@@ -831,6 +860,10 @@ def ocean_image(w: int, h: int, name: str | None = None):
 
     同源 dafy-whale-theme 的 .dafy-wash（30% / 26% / 14%，soft-light 叠加）。
     这里用 alpha 叠加近似同一观感（Tk 没有 mix-blend-mode）。
+
+    渐变要"看得见"才叫铺满整窗：起始色是 bg_base（浅海近白、深海近黑），
+    结束色往青蓝推（浅 22% / 深 30%）。一开始只往 layer2 推 75%，两个色
+    只差 9 个数，渲出来跟纯色没区别 —— 窗口四边露出来的海成了"白边"。
     """
     if not _HAS_PIL or w < 8 or h < 8:
         return None
@@ -843,7 +876,8 @@ def ocean_image(w: int, h: int, name: str | None = None):
     img = Image.new("RGB", (w, h), t.bg_base)
     d = ImageDraw.Draw(img)
     # 纵向渐变：上浅下深，像从水面往下看
-    deep = mix(t.bg_base, t.layer2, 0.75)
+    deep_c = mix(GLOW[1], GLOW[0], 0.35)            # 青蓝之间，别太艳
+    deep = mix(t.bg_base, deep_c, 0.44 if t.light else 0.42)
     for y in range(h):
         d.line([(0, y), (w, y)], fill=mix(t.bg_base, deep, y / max(1, h - 1)))
 
@@ -881,15 +915,87 @@ def ocean_image(w: int, h: int, name: str | None = None):
     return img
 
 
+def _ocean_pos(widget):
+    """widget 在窗口坐标里的 (x, y) 以及窗口尺寸；拿不到就返回 None。"""
+    try:
+        root = widget.winfo_toplevel()
+        WW, HH = int(root.winfo_width()), int(root.winfo_height())
+        if WW < 8 or HH < 8:
+            return None
+        return (int(widget.winfo_rootx()) - int(root.winfo_rootx()),
+                int(widget.winfo_rooty()) - int(root.winfo_rooty()), WW, HH)
+    except (tk.TclError, AttributeError):
+        return None
+
+
+def ocean_crop(widget, w: int, h: int, name: str | None = None, off=(0, 0)):
+    """「整窗海面」里 widget 所在位置的一块（PIL 图，不是 PhotoImage）。
+
+    位置按屏幕坐标减窗口原点算，所以嵌在滚动区域里的卡片也适用（滚到哪算哪）。
+    off 是相对 widget 左上角再偏一点（画投影时要比控件本身大一圈）。
+    """
+    if not _HAS_PIL or w < 2 or h < 2:
+        return None
+    _ensure_root()
+    pos = _ocean_pos(widget)
+    if pos is None:
+        return None
+    x, y = pos[0] + int(off[0]), pos[1] + int(off[1])
+    WW, HH = pos[2], pos[3]
+    key = ("c", x, y, int(w), int(h), name or THEME)
+    hit = _CROP_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ocean = ocean_image(WW, HH, name or THEME)
+    if ocean is None:
+        return None
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(WW, x + int(w)), min(HH, y + int(h))
+    # 超出窗口的部分用底色补满：只在控件伸到窗口外时发生，正常布局碰不到
+    img = Image.new("RGB", (int(w), int(h)), palette(name or THEME).bg_base)
+    if x1 > x0 and y1 > y0:
+        img.paste(ocean.crop((x0, y0, x1, y1)), (x0 - x, y0 - y))
+    if len(_CROP_CACHE) > 16:
+        _CROP_CACHE.clear()
+    _CROP_CACHE[key] = img
+    return img
+
+
+def ocean_slice(widget, w: int, h: int, name: str | None = None):
+    """ocean_crop 的 PhotoImage 版：给「本身就是海面」的控件当背景图（列表底、滚动条）。"""
+    if not _HAS_PIL or w < 2 or h < 2:
+        return None
+    _ensure_root()
+    pos = _ocean_pos(widget)
+    if pos is None:
+        return None
+    key = ("p", pos[0], pos[1], int(w), int(h), name or THEME)
+    hit = _SLICE_CACHE.get(key)
+    if hit is not None:
+        return hit
+    crop = ocean_crop(widget, w, h, name)
+    if crop is None:
+        return None
+    photo = ImageTk.PhotoImage(crop)
+    if len(_SLICE_CACHE) > 24:       # 窗口越拉越大时位置键会变，别无限攒
+        _SLICE_CACHE.clear()
+    _SLICE_CACHE[key] = photo
+    return photo
+
+
 class OceanBackdrop(tk.Canvas):
     """铺满父容器的海面背景。当作底层：先 place/pack 它，再把内容放上面。
 
     Tk 的 Frame 不透明，所以光晕只会在卡片之间的缝隙里露出来 —— 这正是想要的效果：
     内容浮在海水上。窗口 resize 后 120ms 重建一次，重建有缓存。
+
+    crop=True 时不再自己渲染一张海面，而是从整窗那张里裁出自己这一块 ——
+    这样窗口里好几个海面面板（根背景 / 右栏 / 左列）拼起来是同一片海，接缝对得上。
     """
 
-    def __init__(self, master, theme: str | None = None, **kw) -> None:
+    def __init__(self, master, theme: str | None = None, crop: bool = False, **kw) -> None:
         self._name = theme or THEME
+        self._crop = crop
         t = palette(self._name)
         super().__init__(master, bg=t.bg_base, highlightthickness=0, bd=0, **kw)
         self._job = None
@@ -906,14 +1012,17 @@ class OceanBackdrop(tk.Canvas):
 
     def _paint(self, w: int, h: int) -> None:
         self._job = None
-        img = ocean_image(w, h, self._name)
         self.delete("bg")
-        if img is None:                      # 没有 Pillow：退化成纯色
-            t = palette(self._name)
-            self.configure(bg=t.bg_base)
+        if self._crop:
+            photo = ocean_slice(self, w, h, self._name)
+        else:
+            img = ocean_image(w, h, self._name)
+            photo = None if img is None else ImageTk.PhotoImage(img)
+        if photo is None:                    # 没有 Pillow：退化成纯色
+            self.configure(bg=palette(self._name).bg_base)
             return
-        self._img = ImageTk.PhotoImage(img)
-        self.create_image(0, 0, image=self._img, anchor="nw", tags="bg")
+        self._img = photo
+        self.create_image(0, 0, image=photo, anchor="nw", tags="bg")
         self.tag_lower("bg")
 
 

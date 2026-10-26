@@ -86,6 +86,16 @@ apply_theme(_saved_theme())
 FONT_UI = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
 
+# ── 版式常量（窗口四周留白 / 分栏缝宽 / 左列卡片留白）───────────────────────
+# 整窗背景是一片海：头卡、状态卡两边各留 GUT，海就从缝里露出来；
+# 缝隙给得比一般界面慷慨（卡片间距 12px），因为"浮在水上"的观感全靠这些缝 ——
+# 缝太窄，海就只剩一圈描边，等于白铺。
+GUT = 16
+SASH_W = 12
+LIST_PAD = (GUT, 10)
+CARD_GAP = 6
+SPLIT_DEFAULT = 0.57
+
 # ── 日志行的级别样式 ────────────────────────────────────────────────────────
 # 级别 → (前缀字形, 标记颜色, 正文颜色, 正文是否加粗)
 # 字形只用 Consolas 确实收录的那几个（实测：✓ ✗ ▸ · 都在），不靠系统字体回退，
@@ -375,20 +385,36 @@ class LauncherApp:
         self.busy = False
         self.restart = False      # 主题切换置 True：main() 见它就把窗口重建成新主题
         self.cfg = core.load_config()
+        # 记住的分栏比例（0＝没存过，用 SPLIT_DEFAULT）。存在 lanes.json → ui.split
+        self._ui = dict(self.cfg.get("ui") or {})
+        try:
+            self._split_frac = float(self._ui.get("split") or 0.0)
+        except (TypeError, ValueError):
+            self._split_frac = 0.0
+        self._split_retry = 0
+        self._sash_hot = False
+        self._poll_id = None
+        self._tick_id = None
+        self._split_id = None
+        self._list_bg = None          # 左列底图（一张海面切片）；不持引用会被回收
+        self._list_bg_job = None
+        self._list_size = (0, 0)
 
         root.title("DSH 多版本启动器")
         root.configure(bg=BG)
-        ui = self.cfg.get("ui") or {}
-        if ui.get("w") and ui.get("h"):
-            root.geometry(f"{int(ui['w'])}x{int(ui['h'])}+{int(ui.get('x', 80))}+{int(ui.get('y', 60))}")
+        g_ui = self.cfg.get("ui") or {}
+        if g_ui.get("w") and g_ui.get("h"):
+            root.geometry(f"{int(g_ui['w'])}x{int(g_ui['h'])}+{int(g_ui.get('x', 80))}+{int(g_ui.get('y', 60))}")
         else:
             self._center(1060, 720)
         root.minsize(880, 560)
         self._style()
 
+        self._build_ocean_backdrop()     # 必须先建：Tk 的叠放顺序就是创建顺序
         self._build_header()
         self._build_body()
         self._build_status()
+        self._split_id = self.root.after(90, self._apply_split)  # 分栏位置要等窗口量出真实宽度
 
         self._sig: tuple | None = None
         self._snap: dict | None = None      # 一轮刷新共用的快照（见 _snapshot）
@@ -403,9 +429,9 @@ class LauncherApp:
             self.log(f"[XX] 首次刷新失败：{type(exc).__name__}: {exc}", "warn")
             self.log("     窗口仍然可用：修掉原因后按 F5 / 点「刷新」重试。", "muted")
             self.log(traceback.format_exc().rstrip(), "muted")
-        self.root.after(120, self._poll_queue)
+        self._poll_id = self.root.after(120, self._poll_queue)
         self.root.after(200, lambda: self.refresh_remote(force=True))  # 不挡开窗，查完再贴上去
-        self.root.after(2000, self._tick)
+        self._tick_id = self.root.after(2000, self._tick)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind("<F5>", lambda _e: self.manual_refresh())
         self.root.bind("<Control-l>", lambda _e: self.clear_log())
@@ -584,11 +610,14 @@ class LauncherApp:
         self._remote_job = None
         # 顶部工具栏：白底 + 一条下边框。原来整页都是灰底、按钮直接浮在上面，
         # 看不出"窗口骨架"；加这一条之后，头/身/脚三段才分得开。
-        shell = tk.Frame(self.root, bg=CARD)
-        shell.pack(fill="x")
-        tk.Frame(shell, bg=BORDER, height=1).pack(side="bottom", fill="x")
-        head = tk.Frame(shell, bg=CARD)
-        head.pack(fill="x", padx=18, pady=(12, 10))
+        # 顶部工具栏：一块浮在海水上的白卡（上面和两边各留 GUT，露出来的就是海面）。
+        # 原来是通栏白带 + 一条下边框；整窗铺海之后，通栏白带会把海拦腰截断。
+        card = ui.RoundedCard(
+            self.root, bg=CARD, border=BORDER, radius=14, padx=18, pady=12,
+            shadow="s2", ocean=True,
+        )
+        card.pack(fill="x", padx=GUT, pady=(GUT, 0))
+        head = card.inner
 
         # 右侧按钮**先** pack：窗口拉到最窄时宁可挤左边的文字，也不能把「＋ 新建版本」挤没
         right = tk.Frame(head, bg=CARD)
@@ -632,58 +661,69 @@ class LauncherApp:
 
     # ── 主体 ────────────────────────────────────────────────────────────────
     def _build_body(self) -> None:
-        body = tk.Frame(self.root, bg=BG)
-        body.pack(fill="both", expand=True, padx=18, pady=(12, 8))
-        body.columnconfigure(0, weight=3, minsize=430)
-        body.columnconfigure(1, weight=2, minsize=330)
-        body.rowconfigure(0, weight=1)
+        """左列表 / 右日志 —— 用 PanedWindow 分栏，中间那条缝能拖（比例会记住）。
 
-        # 左：lane 列表（可滚动）
-        left_wrap = tk.Frame(body, bg=BG)
-        left_wrap.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        整窗背景是一片海（见 _build_ocean_backdrop）：
+          · 左列：滚动区里垫一张海面切片，lane 卡片浮在海上，卡片缝里看得见海；
+          · 右列：一块白卡，工具栏也放进卡片内部 —— 右栏就不会剩一条纯色带；
+          · 中间：SASH_W 像素的缝，海从缝里透出来，鼠标移上去会亮成品牌蓝。
+        """
+        self.split = tk.PanedWindow(
+            self.root, orient="horizontal", bg=BG, bd=0, relief="flat",
+            sashwidth=SASH_W, sashrelief="flat", sashcursor="sb_h_double_arrow",
+            opaqueresize=True, showhandle=False,
+        )
+        self.split.pack(fill="both", expand=True, pady=(10, 0))
+        self.split.bind("<Motion>", self._on_split_motion)
+        self.split.bind("<Leave>", lambda _e: self._set_sash_hot(False))
+        self.split.bind("<ButtonRelease-1>", self._on_split_release)
+
+        # ── 左：lane 列表（可滚动）
+        left_wrap = tk.Frame(self.split, bg=BG)
         left_wrap.rowconfigure(0, weight=1)
         left_wrap.columnconfigure(0, weight=1)
 
         self.canvas = tk.Canvas(left_wrap, bg=BG, highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        sb = ui.MiniScrollbar(left_wrap, command=self.canvas.yview, bg=BG)
+        sb = ui.MiniScrollbar(left_wrap, command=self.canvas.yview, bg=BG, ocean=True)
         sb.grid(row=0, column=1, sticky="ns", padx=(2, 0))
         self.canvas.configure(yscrollcommand=sb.set)
 
-        self.list_frame = tk.Frame(self.canvas, bg=BG)
+        # 列表底：Label 装一张海面切片。
+        # 为什么不用 Frame：Tk 的容器全都不透明，Frame 会整片盖住背后的海；
+        # Label 的 image 画在**子控件下面**（实测），所以卡片之间的缝里看见的是真海面。
+        self.list_frame = tk.Label(self.canvas, bd=0, highlightthickness=0, bg=BG)
         self._win = self.canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
-        self.list_frame.bind(
-            "<Configure>", lambda _e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        )
-        self.canvas.bind(
-            "<Configure>", lambda e: self.canvas.itemconfigure(self._win, width=e.width)
-        )
+        self.list_frame.bind("<Configure>", lambda _e: self._layout_list())
+        self.canvas.bind("<Configure>", lambda e: self._layout_list(e.width, e.height))
         self.canvas.bind_all("<MouseWheel>", self._on_wheel)
+        self.split.add(left_wrap, minsize=420, stretch="always")
 
-        # 右：日志 —— 圆角面板 + 时间戳列 + 级别标记 + 空状态 + 自动滚动
-        right = tk.Frame(body, bg=BG)
-        right.grid(row=0, column=1, sticky="nsew")
-        right.rowconfigure(1, weight=1)
+        # ── 右：日志 —— 海面垫底 + 一整块白卡（标题栏/清空/复制也在卡片里）
+        right = ui.OceanBackdrop(self.split, crop=True)
+        right.rowconfigure(0, weight=1)
         right.columnconfigure(0, weight=1)
+        self.split.add(right, minsize=330, stretch="always")
 
-        bar = tk.Frame(right, bg=BG)
-        bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        tk.Label(bar, text="实时日志", bg=BG, fg=TEXT, font=(FONT_UI, 11, "bold")).pack(side="left")
-        self.log_count = tk.Label(bar, text="", bg=BG, fg=ui.SUBTLE, font=(FONT_UI, 9))
+        panel = ui.RoundedCard(
+            right, bg=CARD, border=BORDER, radius=12,
+            padx=10, pady=4, fill=True, width=1, height=1, shadow="s2", ocean=True,
+        )
+        panel.grid(row=0, column=0, sticky="nsew", padx=(0, GUT), pady=(0, GUT - 2))
+        wrap = panel.inner
+        wrap.rowconfigure(2, weight=1)
+        wrap.columnconfigure(0, weight=1)
+
+        bar = tk.Frame(wrap, bg=CARD)
+        bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        tk.Label(bar, text="实时日志", bg=CARD, fg=TEXT, font=(FONT_UI, 11, "bold")).pack(side="left")
+        self.log_count = tk.Label(bar, text="", bg=CARD, fg=ui.SUBTLE, font=(FONT_UI, 9))
         self.log_count.pack(side="left", padx=(8, 0))
         self.button(bar, "清空", self.clear_log, variant="ghost", size="sm").pack(side="right")
         self.button(bar, "复制全部", self.copy_log, variant="ghost", size="sm").pack(
             side="right", padx=4
         )
-
-        panel = ui.RoundedCard(
-            right, bg=CARD, border=BORDER, radius=10,
-            padx=4, pady=4, fill=True, width=1, height=1,
-        )
-        panel.grid(row=1, column=0, sticky="nsew")
-        wrap = panel.inner
-        wrap.rowconfigure(0, weight=1)
-        wrap.columnconfigure(0, weight=1)
+        tk.Frame(wrap, bg=_T.line1, height=1).grid(row=1, column=0, columnspan=2, sticky="ew")
 
         # 日志排版：时间戳小一号、级别字形一列、正文 10pt；折行用 lmargin2 缩进到正文起点。
         self._f_log = tkfont.Font(family=FONT_MONO, size=10)
@@ -712,9 +752,9 @@ class LauncherApp:
             insertbackground=TEXT,
             state="disabled",
         )
-        self.log_text.grid(row=0, column=0, sticky="nsew")
+        self.log_text.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
         self.log_sb = ui.MiniScrollbar(wrap, command=self.log_text.yview, bg=CARD)
-        self.log_sb.grid(row=0, column=1, sticky="ns", padx=(0, 4))
+        self.log_sb.grid(row=2, column=1, sticky="ns", padx=(0, 4), pady=(6, 0))
         self.log_text.configure(yscrollcommand=self.log_sb.set)
 
         T = self.log_text
@@ -756,18 +796,135 @@ class LauncherApp:
             T.bind(seq, lambda _e: self.root.after(20, self._sync_autoscroll), add="+")
 
     def _build_status(self) -> None:
-        # 底部状态条：和顶部一样是一条白带 + 上边框，收住整个窗口
-        shell = tk.Frame(self.root, bg=CARD)
-        shell.pack(fill="x")
-        tk.Frame(shell, bg=BORDER, height=1).pack(side="top", fill="x")
-        bar = tk.Frame(shell, bg=CARD)
-        bar.pack(fill="x", padx=18, pady=7)
+        # 底部状态条：也是一块浮在海水上的白卡，收住整个窗口
+        card = ui.RoundedCard(self.root, bg=CARD, border=BORDER, radius=12,
+                              padx=16, pady=7, ocean=True)
+        card.pack(fill="x", padx=GUT, pady=(8, GUT))
+        bar = card.inner
         self.status = tk.Label(bar, text="就绪", bg=CARD, fg=MUTED, font=(FONT_UI, 9), anchor="w")
         self.status.pack(side="left")
         self.busy_label = tk.Label(bar, text="", bg=CARD, fg=ACCENT, font=(FONT_UI, 9, "bold"))
         self.busy_label.pack(side="right")
         self.counts = tk.Label(bar, text="", bg=CARD, fg=MUTED, font=(FONT_UI, 9))
         self.counts.pack(side="right", padx=14)
+
+    # ── 整窗海面 / 可拖拽分栏 ────────────────────────────────────────────────
+    def _build_ocean_backdrop(self) -> None:
+        """把整窗铺成一片海：先 place 一张海面画布，后面建的控件都盖在它上面。
+
+        为什么用 place 而不是 pack：pack 会把窗口切成一条条，它只会分到"剩下的
+        那条缝"；place(relwidth=1, relheight=1) 才真正铺满整窗。Tk 的叠放顺序＝
+        创建顺序，所以它必须**最先**建 —— 后面 build 的头部/主体/状态都压在它上面，
+        没被控件盖住的地方（窗口四边、分栏缝、卡片之间）露出来的就是海面。
+        """
+        self._ocean = ui.OceanBackdrop(self.root)
+        self._ocean.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+        # 注意：不要在这里调 self._ocean.lower() —— Canvas 上的 lower/raise 是「图形项
+        # 层级」，要 tagOrId，会直接抛 wrong # args。叠放顺序＝创建顺序，先建就够低了。
+
+    def _layout_list(self, w: int | None = None, h: int | None = None) -> None:
+        """左列布局：内容比视口短时把列表撑满视口（否则底下会露一条纯色），
+        同时决定底图要多大，变了才重画（拖动窗口时不会每像素重算一张图）。
+        """
+        try:
+            cw = int(w if w is not None else self.canvas.winfo_width())
+            ch = int(h if h is not None else self.canvas.winfo_height())
+        except tk.TclError:
+            return
+        need = max(1, self.list_frame.winfo_reqheight())
+        ch2 = max(need, ch)
+        try:
+            self.canvas.itemconfigure(self._win, width=max(1, cw), height=ch2)
+            self.canvas.configure(scrollregion=(0, 0, cw, ch2))
+        except tk.TclError:
+            return
+        if (cw, ch2) != self._list_size:
+            self._list_size = (cw, ch2)
+            self._paint_list_bg()
+
+    def _paint_list_bg(self) -> None:
+        if self._list_bg_job is not None:
+            try:
+                self.root.after_cancel(self._list_bg_job)
+            except Exception:
+                pass
+        self._list_bg_job = self.root.after(120, self._do_paint_list_bg)
+
+    def _do_paint_list_bg(self) -> None:
+        self._list_bg_job = None
+        try:
+            w, h = int(self.list_frame.winfo_width()), int(self.list_frame.winfo_height())
+        except tk.TclError:
+            return
+        photo = ui.ocean_slice(self.list_frame, w, h)
+        if photo is None:
+            return
+        self._list_bg = photo
+        try:
+            self.list_frame.configure(image=photo)
+        except tk.TclError:
+            pass
+
+    def _on_split_motion(self, e) -> None:
+        """鼠标靠近分栏缝时把它点亮 —— 光一条 9px 的缝，不亮起来没人知道能拖。"""
+        try:
+            self._set_sash_hot(abs(e.x - int(self.split.sash_coord(0)[0])) <= 7)
+        except (tk.TclError, IndexError):
+            pass
+
+    def _set_sash_hot(self, hot: bool) -> None:
+        if hot == self._sash_hot:
+            return
+        self._sash_hot = hot
+        # 亮成品牌蓝，而不是"淡一点的蓝"：缝本来就窄，淡色在整窗海面上根本看不见
+        try:
+            self.split.configure(bg=(ui.ACCENT if hot else BG))
+        except tk.TclError:
+            pass
+
+    def _split_frac_now(self) -> float:
+        try:
+            w = int(self.split.winfo_width())
+            x = int(self.split.sash_coord(0)[0])
+        except (tk.TclError, AttributeError, IndexError, ValueError):
+            return 0.0
+        if w < 200:
+            return 0.0
+        return max(0.05, min(0.95, x / float(w)))
+
+    def _apply_split(self) -> None:
+        """把记住的比例还原成分栏位置；窗口还没量出宽度就过一会儿再试（最多 25 次）。"""
+        self._split_id = None
+        try:
+            w = int(self.split.winfo_width())
+        except (tk.TclError, AttributeError):
+            return
+        if w < 200:
+            if self._split_retry < 25:
+                self._split_retry += 1
+                self._split_id = self.root.after(120, self._apply_split)
+            return
+        frac = self._split_frac if 0.15 <= self._split_frac <= 0.85 else SPLIT_DEFAULT
+        x = max(420, min(int(w * frac), w - 330 - SASH_W))
+        try:
+            self.split.sash_place(0, x, 0)
+        except tk.TclError:
+            pass
+
+    def _on_split_release(self, _e=None) -> None:
+        """拖完就存：别等关窗口，万一被强杀也不丢比例。"""
+        frac = self._split_frac_now()
+        if not frac:
+            return
+        self._split_frac = frac
+        try:
+            cfg = core.load_config()
+            u = dict(cfg.get("ui") or {})
+            u["split"] = round(frac, 4)
+            cfg["ui"] = u
+            core.save_config(cfg)
+        except Exception:
+            pass
 
     def _on_wheel(self, event) -> None:
         # 这个绑定是 bind_all 的，日志面板里滚轮也会冒过来：只有指针真在列表上才滚列表
@@ -1001,15 +1158,17 @@ class LauncherApp:
         lanes = self.cfg.get("lanes", {})
         top = core.primary_lane(self.cfg)
         if not lanes:
-            box = tk.Frame(self.list_frame, bg=CARD, highlightbackground=BORDER, highlightthickness=1)
-            box.pack(fill="x", pady=4)
+            card = ui.RoundedCard(self.list_frame, bg=CARD, border=BORDER, radius=10,
+                                  padx=16, pady=14, ocean=True)
+            card.pack(fill="x", pady=CARD_GAP, padx=LIST_PAD)
+            box = card.inner
             tk.Label(
                 box,
                 text="还没有任何 lane",
                 bg=CARD,
                 fg=TEXT,
                 font=(FONT_UI, 11, "bold"),
-            ).pack(anchor="w", padx=16, pady=(14, 2))
+            ).pack(anchor="w", pady=(0, 2))
             tk.Label(
                 box,
                 text="点右上角「＋ 新建版本」，选一个版本装进来（例如 next / 0.1.7-rc.2），\n"
@@ -1020,7 +1179,7 @@ class LauncherApp:
                 fg=MUTED,
                 font=(FONT_UI, 9),
                 justify="left",
-            ).pack(anchor="w", padx=16, pady=(0, 14))
+            ).pack(anchor="w")
         else:
             top_refs = (
                 core.read_credential_refs((self.cfg["lanes"].get(top) or {}).get("home") or "")
@@ -1039,22 +1198,33 @@ class LauncherApp:
                     primary_name=top,
                     primary_refs=top_refs,
                 )
-                card.pack(fill="x", pady=4)
+                card.pack(fill="x", pady=CARD_GAP, padx=LIST_PAD)
 
         self._build_foreign_section(snap)
         self._update_counts(snap)
 
     # ── 未登记实例 / 系统全局安装 ───────────────────────────────────────────
-    def _section(self, text: str, count: int | None = None, action=None) -> None:
-        """段落标题：卡片区和"下面的杂项"之间的分隔，比正文重、比卡片名轻。"""
-        bar = tk.Frame(self.list_frame, bg=BG)
-        bar.pack(fill="x", pady=(16, 6))
+    def _section_card(self, text: str, count: int | None = None, action=None) -> tk.Frame:
+        """段落卡片：标题 + 计数 + 可选操作长在卡片里，返回下面那个内容区 Frame。
+
+        以前是"一条无底色的标题带 + 一张卡片"，标题带在铺满整窗的海面上会切出
+        一条纯色横条。现在标题就是卡片的第一行 —— 左列只剩白卡片，和卡片之间的海面。
+        """
+        card = ui.RoundedCard(self.list_frame, bg=CARD, border=BORDER, radius=10,
+                              padx=13, pady=10, ocean=True)
+        card.pack(fill="x", pady=(10, CARD_GAP), padx=LIST_PAD)
+        head = tk.Frame(card.inner, bg=CARD)
+        head.pack(fill="x")
         if action is not None:
-            self.link_button(bar, action[0], action[1]).pack(side="right")
-        tk.Label(bar, text=text, bg=BG, fg=TEXT,
+            self.link_button(head, action[0], action[1]).pack(side="right")
+        tk.Label(head, text=text, bg=CARD, fg=TEXT,
                  font=(FONT_UI, 10, "bold")).pack(side="left")
         if count:
-            ui.Chip(bar, str(count), "ver", bg=BG).pack(side="left", padx=(7, 0))
+            ui.Chip(head, str(count), "ver", bg=CARD).pack(side="left", padx=(7, 0))
+        tk.Frame(card.inner, bg=_T.line1, height=1).pack(fill="x", pady=(8, 8))
+        body = tk.Frame(card.inner, bg=CARD)
+        body.pack(fill="x")
+        return body
 
     def _build_foreign_section(self, snap: dict) -> None:
         instances = snap["foreign"]
@@ -1066,26 +1236,25 @@ class LauncherApp:
         # 没有未登记实例时整段省略：原来会留一个标题 +「（当前没有别的 DSH 实例在跑）」，
         # 两行字只说明"什么都没发生"，纯属噪音。
         if instances:
-            self._section("未登记的实例（不是本启动器启动的）", len(instances))
-            for item in instances:
-                card = ui.RoundedCard(
-                    self.list_frame, bg=CARD, border=BORDER, radius=10, padx=13, pady=10,
-                )
-                card.pack(fill="x", pady=4)
-                pad = card.inner
+            pad = self._section_card("未登记的实例（不是本启动器启动的）", len(instances))
+            for idx, item in enumerate(instances):
+                if idx:
+                    tk.Frame(pad, bg=_T.line1, height=1).pack(fill="x", pady=8)
+                row = tk.Frame(pad, bg=CARD)
+                row.pack(fill="x")
 
-                btns = tk.Frame(pad, bg=CARD)
+                btns = tk.Frame(row, bg=CARD)
                 btns.pack(side="right")
                 self.button(btns, "打开页面", lambda u=item["url"]: self.open_url(u),
                             primary=True, size="sm").pack(side="left", padx=3)
                 self.button(btns, "结束进程", lambda i=item: self.kill_instance(i),
                             danger=True, size="sm").pack(side="left", padx=3)
 
-                ui.Pill(pad, "像是 DSH" if item["dsh_like"] else "占用中",
+                ui.Pill(row, "像是 DSH" if item["dsh_like"] else "占用中",
                         "warn" if item["dsh_like"] else "off",
                         bg=CARD).pack(side="right", padx=(0, 12))
 
-                left = tk.Frame(pad, bg=CARD)
+                left = tk.Frame(row, bg=CARD)
                 left.pack(side="left", fill="x", expand=True)
                 tk.Label(
                     left,
@@ -1121,16 +1290,11 @@ class LauncherApp:
                 link.bind("<Button-1>", lambda _e, u=item["url"]: self.copy_text(u))
 
         if installs:
-            self._section(
+            pad = self._section_card(
                 "本机各套安装（你平时在用的那份在这里）",
                 len(installs),
                 action=("打开根目录", self.open_root_dir),
             )
-            card = ui.RoundedCard(
-                self.list_frame, bg=CARD, border=BORDER, radius=10, padx=13, pady=10,
-            )
-            card.pack(fill="x", pady=4)
-            pad = card.inner
             for idx, item in enumerate(installs):
                 if idx:
                     tk.Frame(pad, bg=_T.line1, height=1).pack(fill="x", pady=8)
@@ -1176,7 +1340,7 @@ class LauncherApp:
                 self.refresh_lanes(force=False)
             except Exception:
                 pass
-        self.root.after(2500, self._tick)
+        self._tick_id = self.root.after(2500, self._tick)
 
     # ── 任务执行（后台线程 + 日志流）────────────────────────────────────────
     def run_job(self, title: str, fn, on_done=None) -> None:
@@ -1237,7 +1401,7 @@ class LauncherApp:
             pass
         if pending:
             self._log_lines(pending)
-        self.root.after(120, self._poll_queue)
+        self._poll_id = self.root.after(120, self._poll_queue)
 
     # ── 操作 ────────────────────────────────────────────────────────────────
     def open_lane(self, lane: str, port: int | None = None) -> None:
@@ -2883,6 +3047,7 @@ class LauncherApp:
         except Exception:
             pass
         self.restart = True
+        self._stop_jobs()
         self.root.after(40, self.root.destroy)
 
     def _save_geometry(self) -> None:
@@ -2891,13 +3056,33 @@ class LauncherApp:
             if w < 400 or h < 300:  # 最小化/异常状态下不记
                 return
             cfg = core.load_config()
-            # 保留 ui 里的其它键（主题就是存在这里的）：整体覆盖会把 ui.theme 抹掉
+            # 保留 ui 里的其它键（主题、分栏比例都存在这里）：整体覆盖会把它们抹掉
             u = dict(cfg.get("ui") or {})
             u.update({"w": w, "h": h, "x": self.root.winfo_x(), "y": self.root.winfo_y()})
+            frac = self._split_frac_now()
+            if frac:
+                u["split"] = round(frac, 4)
             cfg["ui"] = u
             core.save_config(cfg)
         except Exception:
             pass
+
+    def _stop_jobs(self) -> None:
+        """销毁窗口之前，把挂着的定时任务取消掉。
+
+        不取消的话，`after` 排着的回调在窗口销毁后仍会被 Tcl 触发一次，
+        控制台上就是一串 `invalid command name "..._poll_queue"` —— 换主题时
+        每次重建都会刷一遍（不是崩溃，但很难看）。
+        """
+        for attr in ("_poll_id", "_tick_id", "_split_id", "_list_bg_job", "_remote_job"):
+            job = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if job is None:
+                continue
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
 
     def _on_close(self) -> None:
         """关窗口就只是关窗口 —— 绝不顺手停掉正在跑的 DSH。
@@ -2917,6 +3102,7 @@ class LauncherApp:
                 ]
             )
         self._save_geometry()
+        self._stop_jobs()
         self.root.destroy()
 
 
