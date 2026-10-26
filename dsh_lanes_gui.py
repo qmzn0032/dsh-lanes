@@ -976,26 +976,24 @@ class LauncherApp:
             except Exception:
                 pass
         self._align_job = self.root.after(90, self._align_ocean_cards)
-        # Windows 上「滚完卡片变空白」的补丁：等 Tk 把窗口项挪完（idle）再强制重画
+        # Windows 上「滚完卡片变空白」的补丁：把左列标成脏（见 redraw_windows）
         self._schedule_list_redraw()
 
     def _schedule_list_redraw(self) -> None:
-        """排一次「把左列标记成脏」。重复排会合并，只留最后一次（40ms 后）。
+        """把左列标成脏。**立刻标，不排队。**
 
-        v0.3.5 这里是"30/90/180ms 连补三次"，理由是重排要一两轮才收敛。
-        结果是：滚一格轮子擦三遍，界面看上去在打摆子。现在补画本身是免费的
-        （只标记脏，不擦不画），所以没必要连补 —— 一次标记就够，Windows 自己会
-        把这一轮所有的脏区域合并。真要收敛不完，卡片自检（_heal_cards）会兜底。
+        这个名字留着只是因为调用点都在这份代码里，实际已经"不排队"了 ——
+        v0.3.6 是 `after(40, ...)` 延迟标脏，而每次来新的滚动/改尺寸事件都会
+        `after_cancel` 掉上一次再重排。问题就出在这：拖分栏、拖窗口边的时候事件
+        每 16~45ms 来一次，**永远比 40ms 早**，于是那个任务被无限次取消、一次也
+        没跑过 —— 左列在整个拖动过程中都是空的，鼠标一停才"啪"一下长回来。
+        这就是「一变就一闪一闪」的真正来源，跟擦不擦底色无关。
+
+        标脏本身只有几微秒（不擦、不画，只是告诉 Windows 这块要重画），
+        一秒标 60 次也毫无成本：Windows 会把它们合并成一次 WM_PAINT。
+        所以正确的做法是"每次事件都标"，而不是"等一会儿再标"。
         """
-        if self._redraw_job is not None:
-            try:
-                self.root.after_cancel(self._redraw_job)
-            except Exception:
-                pass
-        self._redraw_job = self.root.after(40, self._repaint_list_after_scroll)
-
-    def _repaint_list_after_scroll(self) -> None:
-        self._redraw_job = None
+        self._redraw_job = None          # 不再排队，保留属性只是为了 _stop_jobs 兼容
         self._repaint_list_now()
 
     def _align_ocean_cards(self) -> None:
@@ -1012,6 +1010,8 @@ class LauncherApp:
                         child.heal()
                 except tk.TclError:
                     continue
+        # 对位等于"换了一张底图"，换完同样要把子窗口标脏才看得见
+        self._repaint_list_now()
 
     def _on_list_configure(self, e) -> None:
         """左列内容变高/变宽了才重算布局。
