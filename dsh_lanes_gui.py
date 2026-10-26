@@ -42,25 +42,46 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 LANE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 
 # ── 配色：全部指向「蓝色大肥鱼」令牌层（theme_whale）─────────────────────────
-# 这里不再写死十六进制：换主题只改 ui.set_theme("dark") 一行，整窗跟着走。
+# 这里不再写死十六进制：换主题只走 apply_theme()，整窗跟着走。
 # 旧值（#F4F5F7 / #6B7280 / #4D6BFE …）是通用灰调，次要文字对比度只有 2.96:1，
 # 已低于 WCAG AA 正文的 4.5:1；新令牌的对应值是 5.51:1。
-_T = ui.theme()
-BG = _T.bg_base
-CARD = _T.layer1
-BORDER = _T.line1
-TEXT = _T.label1
-MUTED = _T.label2
-ACCENT = _T.brand
-ACCENT_DK = _T.brand_hover
-GREEN = _T.success
-GREEN_BG = _T.success_bg
-GRAY = _T.decor
-GRAY_BG = _T.layer2
-RED = _T.error_fg
-RED_BG = _T.error_bg
-AMBER = _T.warn_fg
-AMBER_BG = _T.warn_bg
+def _saved_theme() -> str:
+    """上次选的主题（lanes.json → ui.theme），没选过就浅海。"""
+    try:
+        name = str((core.load_config().get("ui") or {}).get("theme") or "")
+    except Exception:
+        name = ""
+    return "dark" if name.startswith("d") else "light"
+
+
+def apply_theme(name: str) -> None:
+    """切换主题 = 换这一层的全局色常量。
+
+    Tk 没有样式层，这些常量在 import 时就落到各处的默认参数里了，所以改主题之后
+    必须**重建窗口**（见 main() 的重启循环），不能"就地变色"。
+    """
+    global _T, BG, CARD, BORDER, TEXT, MUTED, ACCENT, ACCENT_DK, GREEN, GREEN_BG
+    global GRAY, GRAY_BG, RED, RED_BG, AMBER, AMBER_BG
+    ui.set_theme(name)
+    _T = ui.theme()
+    BG = _T.bg_base
+    CARD = _T.layer1
+    BORDER = _T.line1
+    TEXT = _T.label1
+    MUTED = _T.label2
+    ACCENT = _T.brand
+    ACCENT_DK = _T.brand_hover
+    GREEN = _T.success
+    GREEN_BG = _T.success_bg
+    GRAY = _T.decor
+    GRAY_BG = _T.layer2
+    RED = _T.error_fg
+    RED_BG = _T.error_bg
+    AMBER = _T.warn_fg
+    AMBER_BG = _T.warn_bg
+
+
+apply_theme(_saved_theme())
 
 FONT_UI = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
@@ -352,6 +373,7 @@ class LauncherApp:
         self.root = root
         self.q: queue.Queue = queue.Queue()
         self.busy = False
+        self.restart = False      # 主题切换置 True：main() 见它就把窗口重建成新主题
         self.cfg = core.load_config()
 
         root.title("DSH 多版本启动器")
@@ -580,6 +602,9 @@ class LauncherApp:
         )
         self.button(right, "环境自检", lambda: self.run_job("环境自检", lambda: core.cmd_doctor(self.cfg, None)),
                     variant="ghost").pack(side="left", padx=2)
+        # 主题切换：标签写"将要去的那一套"，比写当前状态更好理解（点一下不会误以为关灯）
+        self.button(right, ("浅海" if ui.theme_name() == "dark" else "深海"),
+                    self.toggle_theme, variant="ghost", icon="◐").pack(side="left", padx=2)
         self.button(right, "全部停止", self.stop_all, danger=True).pack(side="left", padx=6)
         self.button(right, "打开根目录", self.open_root_dir).pack(side="left", padx=6)
         self.button(right, "＋ 新建版本", self.new_version_dialog, primary=True).pack(
@@ -2839,13 +2864,37 @@ class LauncherApp:
         reload_versions()
 
     # ── 关闭 ────────────────────────────────────────────────────────────────
+    def toggle_theme(self) -> None:
+        """浅海 ↔ 深海：存进 lanes.json → ui.theme，然后重建窗口（见 main 的重启循环）。
+
+        为什么是重建而不是就地改色：Tk 没有样式层，颜色在控件创建时就定死；
+        逐个控件 configure 一遍既容易漏，又会把状态搞乱。重建一整窗不到 1 秒。
+        """
+        want = "dark" if ui.theme_name() == "light" else "light"
+        try:
+            cfg = core.load_config()
+            u = dict(cfg.get("ui") or {})
+            u["theme"] = want
+            w, h = self.root.winfo_width(), self.root.winfo_height()
+            if w >= 400 and h >= 300:            # 顺带记住当前窗口位置，重建后不跳
+                u.update({"w": w, "h": h, "x": self.root.winfo_x(), "y": self.root.winfo_y()})
+            cfg["ui"] = u
+            core.save_config(cfg)
+        except Exception:
+            pass
+        self.restart = True
+        self.root.after(40, self.root.destroy)
+
     def _save_geometry(self) -> None:
         try:
             w, h = self.root.winfo_width(), self.root.winfo_height()
             if w < 400 or h < 300:  # 最小化/异常状态下不记
                 return
             cfg = core.load_config()
-            cfg["ui"] = {"w": w, "h": h, "x": self.root.winfo_x(), "y": self.root.winfo_y()}
+            # 保留 ui 里的其它键（主题就是存在这里的）：整体覆盖会把 ui.theme 抹掉
+            u = dict(cfg.get("ui") or {})
+            u.update({"w": w, "h": h, "x": self.root.winfo_x(), "y": self.root.winfo_y()})
+            cfg["ui"] = u
             core.save_config(cfg)
         except Exception:
             pass
@@ -2941,57 +2990,69 @@ _REQUIRED_ACTIONS = (
 def main() -> int:
     parser = argparse.ArgumentParser(description="DSH 多版本启动器（图形界面版）")
     parser.add_argument("--selfcheck", action="store_true", help="构建窗口并刷新一次后退出（自动化自检）")
+    parser.add_argument("--theme", choices=("light", "dark"), help="临时指定主题（不写进配置）")
     args = parser.parse_args()
 
     _safe_std_streams()
     enable_dpi_awareness()
-    root = tk.Tk()
-    _set_window_icon(root)
-    try:
-        root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72.0)
-    except Exception:
-        pass
-    try:
-        app = LauncherApp(root)
-    except Exception as exc:  # noqa: BLE001
-        # 绝不留一个"没有 mainloop 的半成品窗口"：那种窗口既不能正常用、也关不掉
-        # （2026-09-27 的故障就是这样：__init__ 里写运行态被拒 → 弹错误框 → 窗口挂着不动）。
-        detail = traceback.format_exc()
-        try:
-            messagebox.showerror(
-                "DSH 多版本启动器 · 启动失败",
-                f"{type(exc).__name__}: {exc}\n\n"
-                f"{detail[-1200:]}\n"
-                "窗口已关闭；完整信息也写到了 stderr（命令行里跑能看到）。",
-            )
-        except Exception:
-            pass
-        try:
-            root.destroy()
-        except Exception:
-            pass
-        print(detail, file=sys.stderr, flush=True)
-        return 1
 
-    if args.selfcheck:
-        root.withdraw()
-        root.update()
-        root.update_idletasks()
-        missing = [m for m in _REQUIRED_ACTIONS if not callable(getattr(app, m, None))]
-        lanes = core.load_config().get("lanes", {})
-        if missing:
-            print(f"[XX] selfcheck 失败：LauncherApp 上找不到这些方法：{'、'.join(missing)}")
-            root.destroy()
+    # 主题切换要重建整窗（Tk 没有样式层），所以主循环套一层：关窗 → 需要就再来一次。
+    while True:
+        apply_theme(args.theme or _saved_theme())
+        root = tk.Tk()
+        _set_window_icon(root)
+        try:
+            root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72.0)
+        except Exception:
+            pass
+        try:
+            app = LauncherApp(root)
+        except Exception as exc:  # noqa: BLE001
+            # 绝不留一个"没有 mainloop 的半成品窗口"：那种窗口既不能正常用、也关不掉
+            # （2026-09-27 的故障就是这样：__init__ 里写运行态被拒 → 弹错误框 → 窗口挂着不动）。
+            detail = traceback.format_exc()
+            try:
+                messagebox.showerror(
+                    "DSH 多版本启动器 · 启动失败",
+                    f"{type(exc).__name__}: {exc}\n\n"
+                    f"{detail[-1200:]}\n"
+                    "窗口已关闭；完整信息也写到了 stderr（命令行里跑能看到）。",
+                )
+            except Exception:
+                pass
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            print(detail, file=sys.stderr, flush=True)
             return 1
-        print(
-            f"selfcheck OK：窗口构建成功，{len(_REQUIRED_ACTIONS)} 个界面入口齐全，"
-            f"lane 数量 {len(lanes)}：{', '.join(lanes) or '(无)'}"
-        )
-        root.destroy()
-        return 0
 
-    root.mainloop()
-    return 0
+        if args.selfcheck:
+            root.withdraw()
+            root.update()
+            root.update_idletasks()
+            missing = [m for m in _REQUIRED_ACTIONS if not callable(getattr(app, m, None))]
+            lanes = core.load_config().get("lanes", {})
+            if missing:
+                print(f"[XX] selfcheck 失败：LauncherApp 上找不到这些方法：{'、'.join(missing)}")
+                root.destroy()
+                return 1
+            print(
+                f"selfcheck OK：窗口构建成功，{len(_REQUIRED_ACTIONS)} 个界面入口齐全，"
+                f"lane 数量 {len(lanes)}：{', '.join(lanes) or '(无)'}"
+                f"，主题 {ui.theme_name()}"
+            )
+            root.destroy()
+            return 0
+
+        root.mainloop()
+        again = bool(getattr(app, "restart", False))
+        try:
+            root.destroy()
+        except Exception:
+            pass
+        if not again:
+            return 0
 
 
 if __name__ == "__main__":

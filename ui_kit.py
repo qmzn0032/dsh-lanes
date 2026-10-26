@@ -161,6 +161,7 @@ def _surface(w: int, h: int, r: int, fill: str, line: str = "", lw: int = 1,
     """
     if not _HAS_PIL or w < 2 or h < 2:
         return None, 0
+    _ensure_root()
     w, h, r, lw = int(w), int(h), int(r), int(lw)
     key = ("s", w, h, r, fill, line, lw, shadow, tint)
     hit = _CACHE.get(key)
@@ -799,6 +800,30 @@ class MiniScrollbar(tk.Canvas):
 
 # ── 海面背景 ────────────────────────────────────────────────────────────────
 _BG_CACHE: dict = {}
+_CACHE_ROOT = None
+
+
+def _ensure_root() -> None:
+    """换一个 Tk 根之后，上一轮的 PhotoImage / Font 全部失效，必须清缓存。
+
+    为什么会有"另一个根"：切换主题时 Tk 没有样式层，只能销毁整窗重建
+    （见 dsh_lanes_gui.main 的重启循环）。不清缓存的话，新窗口里第一次画圆角
+    就会撞上 `image "pyimage1" doesn't exist` —— 图片属于已销毁的那个解释器。
+    """
+    global _CACHE_ROOT
+    root = getattr(tk, "_default_root", None)
+    if root is not _CACHE_ROOT:
+        _CACHE.clear()
+        _BG_CACHE.clear()
+        _FONTS.clear()
+        _CACHE_ROOT = root
+
+
+def clear_cache() -> None:
+    """手动清空渲染缓存（换主题、改缩放时都可调）。"""
+    _CACHE.clear()
+    _BG_CACHE.clear()
+    _FONTS.clear()
 
 
 def ocean_image(w: int, h: int, name: str | None = None):
@@ -809,6 +834,7 @@ def ocean_image(w: int, h: int, name: str | None = None):
     """
     if not _HAS_PIL or w < 8 or h < 8:
         return None
+    _ensure_root()
     key = (w, h, name or THEME)
     hit = _BG_CACHE.get(key)
     if hit is not None:
