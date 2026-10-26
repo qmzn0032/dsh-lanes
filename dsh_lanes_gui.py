@@ -41,22 +41,26 @@ import ui_kit as ui  # noqa: E402  ← 自绘控件库（圆角按钮 / 胶囊 /
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 LANE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$")
 
-# ── 配色（对齐 DSH 的浅色观感）──────────────────────────────────────────────
-BG = "#F4F5F7"
-CARD = "#FFFFFF"
-BORDER = "#E3E5E9"
-TEXT = "#1F2328"
-MUTED = "#6B7280"
-ACCENT = "#4D6BFE"
-ACCENT_DK = "#3A56E0"
-GREEN = "#16A34A"
-GREEN_BG = "#E8F6EE"
-GRAY = "#9CA3AF"
-GRAY_BG = "#F0F1F3"
-RED = "#DC2626"
-RED_BG = "#FDECEC"
-AMBER = "#B45309"
-AMBER_BG = "#FEF3E2"
+# ── 配色：全部指向「蓝色大肥鱼」令牌层（theme_whale）─────────────────────────
+# 这里不再写死十六进制：换主题只改 ui.set_theme("dark") 一行，整窗跟着走。
+# 旧值（#F4F5F7 / #6B7280 / #4D6BFE …）是通用灰调，次要文字对比度只有 2.96:1，
+# 已低于 WCAG AA 正文的 4.5:1；新令牌的对应值是 5.51:1。
+_T = ui.theme()
+BG = _T.bg_base
+CARD = _T.layer1
+BORDER = _T.line1
+TEXT = _T.label1
+MUTED = _T.label2
+ACCENT = _T.brand
+ACCENT_DK = _T.brand_hover
+GREEN = _T.success
+GREEN_BG = _T.success_bg
+GRAY = _T.decor
+GRAY_BG = _T.layer2
+RED = _T.error_fg
+RED_BG = _T.error_bg
+AMBER = _T.warn_fg
+AMBER_BG = _T.warn_bg
 
 FONT_UI = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
@@ -234,7 +238,7 @@ class LaneCard(ui.RoundedCard):
             link.bind("<Leave>", lambda _e: link.configure(fg=ACCENT, text=short_url(url)))
 
         # ── 第二行：次要操作（设为主要版本 / 删除这套 DSH）+ 主要版本说明
-        tk.Frame(pad, bg="#EDEFF2", height=1).pack(fill="x", pady=(7, 5))
+        tk.Frame(pad, bg=_T.line1, height=1).pack(fill="x", pady=(7, 5))
         foot = tk.Frame(pad, bg=CARD)
         foot.pack(fill="x")
 
@@ -1104,7 +1108,7 @@ class LauncherApp:
             pad = card.inner
             for idx, item in enumerate(installs):
                 if idx:
-                    tk.Frame(pad, bg="#EDEFF2", height=1).pack(fill="x", pady=8)
+                    tk.Frame(pad, bg=_T.line1, height=1).pack(fill="x", pady=8)
                 row = tk.Frame(pad, bg=CARD)
                 row.pack(fill="x")
                 self.button(
@@ -1591,7 +1595,7 @@ class LauncherApp:
                     variable=check,
                     bg=CARD,
                     activebackground=CARD,
-                    selectcolor="#FFFFFF",
+                    selectcolor=_T.overlay,
                     highlightthickness=0,
                     bd=0,
                     width=2,
@@ -1713,7 +1717,7 @@ class LauncherApp:
                 fg=AMBER,
                 font=(FONT_UI, 9, "bold"),
                 activebackground=AMBER_BG,
-                selectcolor="#FFFFFF",
+                selectcolor=_T.overlay,
                 anchor="w",
                 padx=10,
                 pady=6,
@@ -2405,7 +2409,7 @@ class LauncherApp:
         wrap.pack(fill="both", expand=True, padx=18, pady=(4, 6))
         scroll = ui.MiniScrollbar(wrap, command=None, bg=CARD)
         box = tk.Listbox(wrap, bg=CARD, fg=TEXT, font=(FONT_MONO, 9), activestyle="none",
-                         selectbackground=ACCENT, selectforeground="#FFFFFF",
+                         selectbackground=ACCENT, selectforeground=_T.on_brand,
                          highlightthickness=0, yscrollcommand=scroll.set)
         scroll.configure(command=box.yview)
         scroll.pack(side="right", fill="y")
@@ -2670,7 +2674,7 @@ class LauncherApp:
                 key_text = f"将从主要版本「{top_lane}」复制：{'、'.join(sorted(refs))}"
                 key_text_on = (f"不继承 —— 主要版本「{top_lane}」的 "
                                f"{'、'.join(sorted(refs))} 不会带过来，首次启动时自己填")
-                key_bg, key_fg = "#EEF1FF", ACCENT_DK
+                key_bg, key_fg = _T.brand_wash, ACCENT_DK
             else:
                 key_text = f"主要版本「{top_lane}」的 HOME 里还没有 API key，这次复制不到东西"
                 key_text_on = f"不继承 —— 主要版本「{top_lane}」本来也没有 key，首次启动时自己填"

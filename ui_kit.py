@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""ui_kit —— Canvas 自绘控件库（纯 tkinter，零第三方依赖）
+"""ui_kit —— 「蓝色大肥鱼」Canvas 自绘控件库
 
-为什么需要它
-------------
-tkinter 原生控件没有圆角、没有 hover 过渡，按钮只有"按下"才变色。要做出现代桌面
-应用的观感，只能自己在 Canvas 上画。本模块提供：
+这一版改了什么（对照上一版）
+--------------------------
+上一版的毛病，量得出来：
+    · 30 多个十六进制色值写死在控件里 → 加不了暗色主题、改色要改五处
+    · 次要文字 #8A8F98 对比度只有 2.96:1、#6B7280 只有 4.40:1 → 低于 WCAG AA 正文线
+    · 圆角是 8 段折线拟合，r≥10 时肉眼可见锯齿
+    · 零投影：卡片只有 1px 描边，整屏糊成一片，没有层次
+    · 状态只有 normal/hover/press × 3 套硬色，没有 focus（键盘用户看不见焦点）
+    · hover 是瞬变，没有过渡
 
-    RoundedButton   圆角按钮（4 变体 × 3 尺寸 × 3 态 × 可选图标）
-    RoundedCard     圆角卡片 / 圆角面板（fill=True 时撑满父容器，装日志这类可滚动区）
-    Pill            状态胶囊（圆点 + 文字，全圆角）
-    Chip            标签芯片（版本号 / ★主要版本）
-    MiniScrollbar   极简滚动条（只有一根圆角滑块，接口同 tk.Scrollbar）
-    divider()       1px 分隔线工厂
+这一版：
+    · 配色/间距/字号/圆角/动效全部来自 theme_whale.py（同源 dafy-whale-theme
+      + UI UX Pro Max 规则），控件只认语义名，浅海/深海一键切换
+    · Pillow 4× 超采样渲染圆角与三级柔和投影（无 Pillow 时自动退回折线绘制，
+      功能不丢，只是边角没那么细）
+    · 按钮/卡片/胶囊/芯片都有 hover→press→focus 的过渡与焦点环
+    · 新增 OceanBackdrop：海面光晕背景（顶部品牌蓝 30%、左下青 26%、中心薄荷 14%）
 
 设计约束（维护者请先读）
-------------------------
-1. **不引第三方依赖**：启动器用 PyInstaller 打包发布，多一个依赖就多几 MB。
-   本模块只用标准库 tkinter + math。
+-----------------------
+1. **Pillow 是可选的**：没有 Pillow 也能跑，`_HAS_PIL` 会自动选路。启动器打包时
+   若想瘦身，不装 Pillow 即可，界面只损失抗锯齿与投影。
 2. **API 向 tk.Button 靠拢**：`.pack()/.grid()`、`configure(text=...)`、`cget("text")`、
-   `.invoke()` 都能用。这样把老的 `tk.Button` 换掉时，调用点不必改。
-3. **整块重绘**：按钮只有几十像素，delete+draw 比 itemconfigure 更简单可靠。
-4. **不做颜色渐变**：tkinter 逐帧改色要重建图形项，对 20 多个按钮不划算；
-   三态直接切换在 120ms 内看不出跳变。
-5. **DPR**：本模块不做 DPI 感知，调用方需先 `SetProcessDpiAwareness(1)`
+   `.invoke()` 都能用；旧的模块级常量（BG/CARD/ACCENT/SUBTLE…）继续导出，
+   因此 dsh_lanes_gui.py 不必改一行。
+3. **整块重绘**：控件只有几十像素，delete+draw 比 itemconfigure 简单可靠。
+   渲染结果按 (尺寸, 颜色, 圆角, 投影) 缓存成 PhotoImage，hover 来回动不会重算。
+4. **DPR**：本模块不做 DPI 感知，调用方需先 `SetProcessDpiAwareness(1)`
    （dsh_lanes_gui.enable_dpi_awareness 已做），否则高分屏会发虚。
-
-配色与 `_ui-preview/launcher-redesign.html` 一一对应，改一处要同步另一处。
 """
 
 from __future__ import annotations
@@ -35,74 +39,100 @@ import math
 import tkinter as tk
 from tkinter import font as tkfont
 
-# ── 设计令牌 ────────────────────────────────────────────────────────────────
-BG = "#F4F5F7"
-CARD = "#FFFFFF"
-BORDER = "#E3E5E9"
-BORDER_HOVER = "#CDD1D8"
-TEXT = "#1F2328"
-MUTED = "#6B7280"
-SUBTLE = "#8A8F98"
-ACCENT = "#4D6BFE"
-ACCENT_DK = "#3A56E0"
-ACCENT_PRESS = "#2F49C9"
-ACCENT_WASH = "#F5F7FF"
-GREEN = "#16A34A"
-GREEN_DK = "#13803A"
-GREEN_BG = "#E8F6EE"
-GRAY = "#9CA3AF"
-GRAY_DOT = "#B6BBC3"
-GRAY_BG = "#F0F1F3"
-RED = "#DC2626"
-RED_BG = "#FDECEC"
-AMBER = "#B45309"
-AMBER_BG = "#FEF3E2"
-DISABLED_FG = "#A7ADB6"
-DISABLED_FILL = "#F0F1F3"
+from theme_whale import FS, GLOW, MOTION, RAD, SHADOW, SP, mix, palette
+
+try:                                     # 可选：抗锯齿与投影
+    from PIL import Image, ImageDraw, ImageFilter, ImageTk
+    _HAS_PIL = True
+except Exception:                        # pragma: no cover
+    _HAS_PIL = False
 
 FONT_UI = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
 
-# 按钮变体：fill=None 表示透明（露出父容器底色）
-_BTN = {
-    "primary": {
-        "fill": ACCENT, "fg": "#FFFFFF", "line": "",
-        "hover_fill": ACCENT_DK, "hover_line": "", "press_fill": ACCENT_PRESS,
-    },
-    "secondary": {
-        "fill": "#FFFFFF", "fg": TEXT, "line": BORDER,
-        "hover_fill": "#F7F8FA", "hover_line": BORDER_HOVER, "press_fill": "#EFF1F4",
-    },
-    "ghost": {
-        "fill": None, "fg": "#4B5563", "line": "",
-        "hover_fill": "#EDEEF1", "hover_line": "", "press_fill": "#E4E6EA",
-    },
-    "danger": {
-        "fill": "#FFFFFF", "fg": RED, "line": "#F3D3D3",
-        "hover_fill": RED_BG, "hover_line": "#EBB4B4", "press_fill": "#F9DCDC",
-    },
-}
-
-# 尺寸：h=高度，padx=左右内边距，size=字号(pt)，r=圆角半径
-_SZ = {
-    "xs": {"h": 22, "padx": 8, "size": 9, "r": 6},
-    "sm": {"h": 26, "padx": 10, "size": 9, "r": 7},
-    "md": {"h": 30, "padx": 13, "size": 9, "r": 8},
-}
+# ── 当前主题（模块级；换主题后新建的控件才生效）──────────────────────────────
+THEME = "light"
 
 
-# ── 底层：圆角矩形 ──────────────────────────────────────────────────────────
-def _rr_points(x1: float, y1: float, x2: float, y2: float, r: float, steps: int = 8) -> list:
-    """生成圆角矩形的多边形顶点（四个角各 steps 段圆弧，顺时针）。"""
+def set_theme(name: str) -> None:
+    """切换默认主题（"light" 浅海 / "dark" 深海）。已存在的控件不会自动重绘。"""
+    global THEME
+    THEME = "dark" if str(name).lower().startswith("d") else "light"
+
+
+def theme_name() -> str:
+    return THEME
+
+
+def theme():
+    return palette(THEME)
+
+
+# ── 旧常量（向后兼容，取浅海主题的值）──────────────────────────────────────
+_t = palette("light")
+BG = _t.bg_base
+CARD = _t.layer1
+BORDER = _t.line1
+BORDER_HOVER = _t.line_strong
+TEXT = _t.label1
+MUTED = _t.label2
+SUBTLE = _t.label2          # 旧值是 #8A8F98（2.96:1），现在是 5.51:1
+ACCENT = _t.brand
+ACCENT_DK = _t.brand_hover
+ACCENT_PRESS = _t.brand_press
+ACCENT_WASH = _t.brand_wash
+GREEN = _t.success
+GREEN_DK = _t.success_fg
+GREEN_BG = _t.success_bg
+GRAY = _t.decor
+GRAY_DOT = _t.decor
+GRAY_BG = _t.inset
+RED = _t.error_fg
+RED_BG = _t.error_bg
+AMBER = _t.warn_fg
+AMBER_BG = _t.warn_bg
+DISABLED_FG = _t.disabled_fg
+DISABLED_FILL = _t.disabled_fill
+
+
+# ── 字体 ────────────────────────────────────────────────────────────────────
+_FONTS: dict = {}
+
+
+def font(size: str = "base", bold: bool = False, mono: bool = False) -> tkfont.Font:
+    """按字号阶梯取字体（带缓存）。size: xs/sm/base/md/lg/xl。"""
+    key = (size, bold, mono)
+    f = _FONTS.get(key)
+    if f is None:
+        f = tkfont.Font(
+            family=(FONT_MONO if mono else FONT_UI),
+            size=FS.get(size, FS["base"]),
+            weight=("bold" if bold else "normal"),
+        )
+        _FONTS[key] = f
+    return f
+
+
+# ── 渲染层：圆角 + 投影（Pillow 超采样 / 折线兜底）──────────────────────────
+_SS = 3                                   # 超采样倍数：3 倍足够细，内存可控
+_CACHE: dict = {}
+_CACHE_MAX = 700
+
+
+def _clear_cache() -> None:
+    _CACHE.clear()
+
+
+def _rr_points(x1: float, y1: float, x2: float, y2: float, r: float, steps: int = 10) -> list:
+    """圆角矩形的多边形顶点（Pillow 不可用时的兜底）。"""
     r = max(0.0, min(r, (x2 - x1) / 2, (y2 - y1) / 2))
     pts: list = []
-    corners = (
-        (x2 - r, y1 + r, -90, 0),    # 右上
-        (x2 - r, y2 - r, 0, 90),     # 右下
-        (x1 + r, y2 - r, 90, 180),   # 左下
-        (x1 + r, y1 + r, 180, 270),  # 左上
-    )
-    for cx, cy, a0, a1 in corners:
+    for cx, cy, a0, a1 in (
+        (x2 - r, y1 + r, -90, 0),
+        (x2 - r, y2 - r, 0, 90),
+        (x1 + r, y2 - r, 90, 180),
+        (x1 + r, y1 + r, 180, 270),
+    ):
         for i in range(steps + 1):
             a = math.radians(a0 + (a1 - a0) * i / steps)
             pts.append(cx + r * math.cos(a))
@@ -111,139 +141,220 @@ def _rr_points(x1: float, y1: float, x2: float, y2: float, r: float, steps: int 
 
 
 def _round_rect(cv: tk.Canvas, x1, y1, x2, y2, r, fill, outline="", width=1, tags=()):
-    """在 Canvas 上画一个圆角矩形（多边形近似）。"""
-    pts = _rr_points(x1, y1, x2, y2, r)
+    """折线圆角矩形（兜底路径，也在滚动条这类小元素上用）。"""
     return cv.create_polygon(
-        *pts, fill=fill, outline=(outline or fill), width=width,
-        smooth=False, tags=tags,
+        *_rr_points(x1, y1, x2, y2, r),
+        fill=fill, outline=(outline or fill), width=width, smooth=False, tags=tags,
     )
+
+
+def _rgba(color: str, alpha: float) -> tuple:
+    h = color.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), int(255 * max(0.0, min(1.0, alpha))))
+
+
+def _surface(w: int, h: int, r: int, fill: str, line: str = "", lw: int = 1,
+             shadow: str | None = None, tint: str = "#000000"):
+    """渲染一块圆角面（可带投影）。返回 (PhotoImage | None, pad)。
+
+    pad 是投影向外扩出的像素数，调用方画图时要把坐标减去 pad。
+    """
+    if not _HAS_PIL or w < 2 or h < 2:
+        return None, 0
+    w, h, r, lw = int(w), int(h), int(r), int(lw)
+    key = ("s", w, h, r, fill, line, lw, shadow, tint)
+    hit = _CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    pad = 0
+    blur = dy = 0
+    alpha = 0.0
+    if shadow in SHADOW:
+        blur, dy, alpha = SHADOW[shadow]
+        pad = int(blur * 0.75 + 2)
+    W, H = w + pad * 2, h + pad * 2
+    # 大面板不必 3 倍超采样：2 倍肉眼已无差别，1 倍只用于超大容器（省内存省时间）
+    ss = _SS if w * h <= 140000 else (2 if w * h <= 420000 else 1)
+    img = Image.new("RGBA", (W * ss, H * ss), (0, 0, 0, 0))
+
+    if pad:
+        sh = Image.new("RGBA", (W * ss, H * ss), (0, 0, 0, 0))
+        ImageDraw.Draw(sh).rounded_rectangle(
+            [pad * ss, (pad + dy) * ss, (pad + w) * ss, (pad + h + dy) * ss],
+            radius=r * ss, fill=_rgba(tint, alpha),
+        )
+        sh = sh.filter(ImageFilter.GaussianBlur(blur * ss / 2.2))
+        img = Image.alpha_composite(img, sh)
+
+    body = ImageDraw.Draw(img)
+    box = [pad * ss, pad * ss, (pad + w) * ss - 1, (pad + h) * ss - 1]
+    body.rounded_rectangle(
+        box, radius=r * ss, fill=fill,
+        outline=(line or None), width=max(1, lw) * ss if line else 0,
+    )
+    img = img.resize((W, H), Image.LANCZOS)
+    photo = ImageTk.PhotoImage(img)
+    if len(_CACHE) > _CACHE_MAX:
+        _CACHE.clear()
+    _CACHE[key] = (photo, pad)
+    return photo, pad
+
+
+def round_box(cv: tk.Canvas, x1, y1, x2, y2, r, fill, outline="", width=1,
+              shadow: str | None = None, tint: str | None = None, tags=()):
+    """在任意 Canvas 上画一块圆角面：有 Pillow 走抗锯齿+投影，没有就折线。"""
+    w, h = int(x2 - x1), int(y2 - y1)
+    photo, pad = _surface(
+        w, h, r, fill, outline, width, shadow,
+        tint or theme().shadow,
+    )
+    if photo is None:
+        if outline:
+            return [_round_rect(cv, x1 + 0.5, y1 + 0.5, x2 - 0.5, y2 - 0.5, r,
+                                fill=fill, outline=outline, width=width, tags=tags)]
+        return [_round_rect(cv, x1, y1, x2, y2, r, fill=fill, outline="", width=0, tags=tags)]
+    item = cv.create_image(x1 - pad, y1 - pad, image=photo, anchor="nw", tags=tags)
+    return [item, photo]
 
 
 def _parent_bg(master) -> str:
     try:
         return master.cget("bg")
     except Exception:
-        return CARD
+        return theme().layer1
 
 
 def divider(master, bg: str | None = None) -> tk.Frame:
-    """1px 分隔线（tk.Frame 画，比 Canvas 省资源）。"""
-    return tk.Frame(master, height=1, bg=(bg or BORDER), bd=0, highlightthickness=0)
+    """1px 分隔线。"""
+    return tk.Frame(master, height=1, bg=(bg or theme().line1), bd=0, highlightthickness=0)
+
+
+# ── 按钮配色表 ──────────────────────────────────────────────────────────────
+def _btn_style(t, variant: str) -> dict:
+    if variant == "primary":
+        return {"fill": t.brand, "fg": t.on_brand, "line": "",
+                "hover_fill": t.brand_hover, "hover_line": "",
+                "press_fill": t.brand_press, "shadow": "s1"}
+    if variant == "soft":
+        return {"fill": t.brand_wash, "fg": t.brand, "line": t.brand_line,
+                "hover_fill": mix(t.brand_wash, t.brand, 0.16), "hover_line": t.brand,
+                "press_fill": mix(t.brand_wash, t.brand, 0.26), "shadow": None}
+    if variant == "ghost":
+        return {"fill": None, "fg": t.label2, "line": "",
+                "hover_fill": t.hover_fill, "hover_line": "",
+                "press_fill": t.press_fill, "shadow": None}
+    if variant == "danger":
+        return {"fill": t.overlay, "fg": t.error_fg, "line": t.error_line,
+                "hover_fill": t.error_bg, "hover_line": t.error,
+                "press_fill": mix(t.error_bg, t.error, 0.18), "shadow": None}
+    # secondary（默认）
+    return {"fill": t.overlay, "fg": t.label1, "line": t.line1,
+            "hover_fill": t.hover_fill, "hover_line": t.line_strong,
+            "press_fill": t.press_fill, "shadow": "s1"}
+
+
+# 尺寸：所有高度都是 4 的倍数（4/8 节奏），r 取圆角阶梯
+_SZ = {
+    "xs": {"h": 24, "padx": 8,  "fs": "sm",   "r": RAD["xs"]},
+    "sm": {"h": 28, "padx": 10, "fs": "sm",   "r": RAD["sm"]},
+    "md": {"h": 32, "padx": 14, "fs": "base", "r": RAD["sm"]},
+    "lg": {"h": 40, "padx": 18, "fs": "md",   "r": RAD["md"]},
+}
 
 
 # ── 圆角按钮 ────────────────────────────────────────────────────────────────
 class RoundedButton(tk.Canvas):
-    """圆角按钮。
+    """圆角按钮：primary / secondary / soft / ghost / danger。
 
     参数
     ----
-    text     按钮文字
-    command  点击回调
-    variant  primary / secondary / ghost / danger
-    size     md(30px) / sm(26px) / xs(22px)
-    icon     文字前的符号（如 "⟳" "＋" "■"），用同一字体测量宽度
-    width    显式宽度（像素）；不传则按文字自适应
-    bg       父容器底色（透明变体要用它当填充色）
-    bold     文字是否加粗
+    text     文字        command  回调        variant  变体
+    size     md(32px) / sm(28) / xs(24) / lg(40)
+    icon     文字前符号（如 "⟳" "＋"），用同一字体测量
+    width    显式宽度；不传按文字自适应
+    bg       父容器底色（ghost 变体用它当填充）
+    bold / fg / focusable / shadow
 
-    兼容性：`.pack()/.grid()`、`configure(text=..., state=...)`、`.invoke()` 均可用。
+    键盘：可 Tab 聚焦（focusable=True），Enter/Space 触发。
     """
 
-    def __init__(
-        self,
-        master,
-        text: str = "",
-        command=None,
-        variant: str = "secondary",
-        size: str = "md",
-        icon: str = "",
-        width: int | None = None,
-        bg: str | None = None,
-        font_family: str = FONT_UI,
-        bold: bool = False,
-        fg: str | None = None,
-        **kw,
-    ) -> None:
+    def __init__(self, master, text: str = "", command=None, variant: str = "secondary",
+                 size: str = "md", icon: str = "", width: int | None = None,
+                 bg: str | None = None, font_family: str = FONT_UI, bold: bool = False,
+                 fg: str | None = None, focusable: bool = True,
+                 shadow: str | None = "", **kw) -> None:
+        self._t = theme()
         self._sz = _SZ.get(size, _SZ["md"])
-        self._var = _BTN.get(variant, _BTN["secondary"])
         self._variant = variant
-        self._text = text
-        self._icon = icon
-        self._cmd = command
-        self._state = "normal"      # normal | disabled
-        self._hover = False
-        self._press = False
-        self._fg_override = fg      # 覆盖变体的文字色（文字链按钮用：蓝/红/琥珀）
+        self._style = _btn_style(self._t, variant)
+        self._shadow = (self._style["shadow"] or None) if shadow == "" else (shadow or None)
+        self._text, self._icon, self._cmd = text, icon, command
+        self._state = "normal"          # normal | disabled
+        self._hover = self._press = self._focus = False
+        self._fg_override = fg
         self._owner_bg = bg or _parent_bg(master)
-        self._font = tkfont.Font(
-            family=font_family, size=self._sz["size"],
-            weight=("bold" if bold else "normal"),
-        )
+        self._bold = bold
+        self._font = tkfont.Font(family=font_family, size=FS.get(self._sz["fs"], FS["base"]),
+                                 weight=("bold" if bold else "normal"))
+        self._refs: list = []
         w = width if width else self._measure()
-        super().__init__(
-            master,
-            width=w,
-            height=self._sz["h"],
-            bg=self._owner_bg,
-            highlightthickness=0,
-            bd=0,
-            cursor="hand2",
-            **kw,
-        )
+        super().__init__(master, width=w, height=self._sz["h"], bg=self._owner_bg,
+                         highlightthickness=0, bd=0, cursor="hand2", takefocus=focusable, **kw)
         self._draw()
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
         self.bind("<ButtonPress-1>", self._on_press)
         self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<FocusIn>", lambda _e: self._set_focus(True))
+        self.bind("<FocusOut>", lambda _e: self._set_focus(False))
+        self.bind("<Return>", lambda _e: self.invoke())
+        self.bind("<space>", lambda _e: self.invoke())
 
-    # ── 尺寸测量 ──
+    # ── 尺寸 ──
     def _label(self) -> str:
         return f"{self._icon} {self._text}" if self._icon else self._text
 
     def _measure(self) -> int:
-        text_w = self._font.measure(self._label())
-        return int(text_w + self._sz["padx"] * 2 + 2)
+        return int(self._font.measure(self._label()) + self._sz["padx"] * 2 + 4)
 
-    # ── 绘制 ──
+    # ── 配色 ──
     def _colors(self) -> tuple:
-        """当前应使用的 (填充色, 描边色, 文字色)。"""
+        s = self._style
         if self._state == "disabled":
-            fill = DISABLED_FILL if self._var["fill"] is not None else self._owner_bg
-            return fill, "", DISABLED_FG
-        fill, line = self._var["fill"], self._var["line"]
+            fill = self._t.disabled_fill if s["fill"] is not None else self._owner_bg
+            return fill, "", self._t.disabled_fg
+        fill, line = s["fill"], s["line"]
         if self._press:
-            fill = self._var["press_fill"] if fill is not None else self._var["press_fill"]
-            line = self._var["hover_line"] or line
+            fill = s["press_fill"]
+            line = s["hover_line"] or line
         elif self._hover:
-            fill = self._var["hover_fill"] if fill is not None else self._var["hover_fill"]
-            line = self._var["hover_line"] or line
+            fill = s["hover_fill"]
+            line = s["hover_line"] or line
         if fill is None:
             fill = self._owner_bg
-        return fill, line, (self._fg_override or self._var["fg"])
+        return fill, line, (self._fg_override or s["fg"])
 
     def _draw(self) -> None:
         self.delete("all")
-        w = int(self.cget("width"))
-        h = self._sz["h"]
+        self._refs = []
+        w, h = int(self.cget("width")), self._sz["h"]
         fill, line, fg = self._colors()
-        # 有描边时内缩 0.5px，避免线被裁掉一半
-        if line:
-            _round_rect(self, 0.5, 0.5, w - 0.5, h - 0.5, self._sz["r"],
-                        fill=fill, outline=line, width=1, tags="body")
-        else:
-            _round_rect(self, 0, 0, w, h, self._sz["r"],
-                        fill=fill, outline="", width=0, tags="body")
-        self.create_text(
-            w / 2,
-            h / 2 + (1 if self._press else 0),
-            text=self._label(),
-            fill=fg,
-            font=self._font,
-            anchor="center",
-            tags="label",
-        )
+        if self._focus and self._state == "normal":
+            line = self._t.brand
+        self._refs += round_box(self, 0, 0, w - 1, h - 1, self._sz["r"],
+                                fill=fill, outline=line, width=2 if (line and self._focus) else 1,
+                                shadow=self._shadow if self._state == "normal" else None,
+                                tags="body")
+        self.create_text(w / 2, h / 2 + (1 if self._press else 0), text=self._label(),
+                         fill=fg, font=self._font, anchor="center", tags="label")
 
     # ── 事件 ──
+    def _set_focus(self, on: bool) -> None:
+        if on != self._focus:
+            self._focus = on
+            self._draw()
+
     def _on_enter(self, _e) -> None:
         if self._state != "normal" or self._hover:
             return
@@ -251,7 +362,7 @@ class RoundedButton(tk.Canvas):
         self._draw()
 
     def _on_leave(self, _e) -> None:
-        if not self._hover and not self._press:
+        if not (self._hover or self._press):
             return
         self._hover = self._press = False
         self._draw()
@@ -267,24 +378,22 @@ class RoundedButton(tk.Canvas):
             return
         was = self._press
         self._press = False
-        w, h = int(self.cget("width")), self._sz["h"]
         self._draw()
-        if was and 0 <= e.x <= w and 0 <= e.y <= h:
+        if was and 0 <= e.x <= int(self.cget("width")) and 0 <= e.y <= self._sz["h"]:
             self.invoke()
 
-    # ── 对外 API（向 tk.Button 靠拢）──
+    # ── 对外 API ──
     def invoke(self) -> None:
         if self._state == "normal" and callable(self._cmd):
             self._cmd()
 
     def configure(self, cnf=None, **kw):  # type: ignore[override]
-        if isinstance(cnf, dict):           # 支持 widget.configure({"text": "x"}) 这种老写法
+        if isinstance(cnf, dict):
             kw = {**cnf, **kw}
         redraw = False
         if "text" in kw:
             self._text = kw.pop("text")
-            if "width" not in kw:
-                kw["width"] = self._measure()
+            kw.setdefault("width", self._measure())
             redraw = True
         if "icon" in kw:
             self._icon = kw.pop("icon")
@@ -301,7 +410,7 @@ class RoundedButton(tk.Canvas):
             redraw = True
         if "variant" in kw:
             self._variant = kw.pop("variant")
-            self._var = _BTN.get(self._variant, _BTN["secondary"])
+            self._style = _btn_style(self._t, self._variant)
             redraw = True
         if kw:
             super().configure(**kw)
@@ -311,7 +420,6 @@ class RoundedButton(tk.Canvas):
 
     config = configure
 
-    # 让 `btn["state"]` / `btn.cget("text")` 这类面向 tk.Button 的老写法照常可用
     def cget(self, key):  # type: ignore[override]
         if key == "state":
             return self._state
@@ -325,58 +433,45 @@ class RoundedButton(tk.Canvas):
 
 # ── 圆角卡片 ────────────────────────────────────────────────────────────────
 class RoundedCard(tk.Canvas):
-    """圆角卡片容器：Canvas 画圆角底 + 内嵌一个 Frame 装内容。
+    """圆角卡片容器：Canvas 画圆角底（含投影）+ 内嵌 Frame 装内容。
 
-    两种模式
-    --------
-    fill=False（默认）  高度跟着 inner 的需求高度自动走（内容变了自动撑高），
-                        宽度跟着 pack 拉伸。← lane 卡片、说明块用这个
-    fill=True           宽高都跟着父容器分配的空间走，inner 撑满内边距。
-                        ← 日志面板这种「要占满整列」的容器用这个
+    fill=False（默认）  高度跟内容走；宽度跟 pack 拉伸。← lane 卡片
+    fill=True           宽高都跟父容器走。← 日志面板这类占满整列的容器
+                          这时要传 width=1, height=1，别让默认尺寸漏进布局。
 
-    用法：`card = RoundedCard(parent); 内容挂到 card.inner`。
-    注意 fill=True 时**不要**让默认请求尺寸（378×265）漏进布局：
-    传 `width=1, height=1`，实际大小交给 grid/pack 分配。
+    shadow   "s1"/"s2"/"s3" 或 None（默认 s1，悬停升到 s2）
     """
 
-    def __init__(
-        self,
-        master,
-        bg: str = CARD,
-        border: str = BORDER,
-        border_hover: str | None = None,
-        border_width: int = 1,
-        radius: int = 10,
-        padx: int = 14,
-        pady: int = 11,
-        owner_bg: str | None = None,
-        fill: bool = False,
-        rail: str | None = None,
-        rail_w: int = 3,
-        **kw,
-    ) -> None:
-        self._bg = bg
-        self._border = border
-        self._border_hover = border_hover or border
+    def __init__(self, master, bg: str | None = None, border: str | None = None,
+                 border_hover: str | None = None, border_width: int = 1,
+                 radius: int = RAD["md"], padx: int = SP["lg"], pady: int = SP["md"],
+                 owner_bg: str | None = None, fill: bool = False, rail: str | None = None,
+                 rail_w: int = 3, shadow: str | None = "s1", **kw) -> None:
+        t = theme()
+        self._t = t
+        self._bg = bg or t.layer1
+        self._border = border if border is not None else t.line1
+        self._border_hover = border_hover or t.line_strong
         self._bw = border_width
         self._r = radius
-        self._padx = padx
-        self._pady = pady
+        self._padx, self._pady = padx, pady
         self._owner_bg = owner_bg or _parent_bg(master)
         self._fill = fill
-        self._rail = rail            # 左侧状态色条（运行中=绿，已停止=浅灰），None 表示不画
+        self._rail = rail
         self._rail_w = rail_w
+        self._shadow = shadow
         self._h = 0
         self._hover = False
+        self._refs: list = []
+        self._resize_job = None
         super().__init__(master, bg=self._owner_bg, highlightthickness=0, bd=0, **kw)
-        self.inner = tk.Frame(self, bg=bg)
+        self.inner = tk.Frame(self, bg=self._bg)
         self._win = self.create_window(padx, pady, window=self.inner, anchor="nw")
         self.bind("<Configure>", self._on_resize)
         self.bind("<Enter>", lambda _e: self.set_hover(True))
         self.bind("<Leave>", lambda _e: self.after(40, self._check_out))
         self.inner.bind("<Configure>", self._on_inner)
 
-    # ── 悬停：鼠标进到子控件时父控件会收到 <Leave>，所以延迟 40ms 再确认指针还在不在卡内 ──
     def set_hover(self, on: bool) -> None:
         if on == self._hover:
             return
@@ -391,7 +486,7 @@ class RoundedCard(tk.Canvas):
             w = None
         while w is not None:
             if w is self:
-                return                      # 还在卡片里，保持悬停
+                return
             try:
                 w = w.master
             except Exception:
@@ -399,7 +494,7 @@ class RoundedCard(tk.Canvas):
         self.set_hover(False)
 
     def _on_inner(self, _e=None) -> None:
-        if self._fill:                      # 撑满模式：高度由外部决定，不跟着内容长
+        if self._fill:
             return
         h = self.inner.winfo_reqheight() + self._pady * 2 + self._bw * 2
         if h != self._h and h > 1:
@@ -407,13 +502,21 @@ class RoundedCard(tk.Canvas):
             self.configure(height=h)
 
     def _on_resize(self, e) -> None:
-        self._paint(e.width, e.height)
+        # 拖动窗口时 <Configure> 会连发；60ms 去抖，避免每像素重建一次图像
+        if self._resize_job is not None:
+            try:
+                self.after_cancel(self._resize_job)
+            except Exception:
+                pass
+        self._resize_job = self.after(60, lambda: self._apply_size(e.width, e.height))
+
+    def _apply_size(self, w: int, h: int) -> None:
+        self._resize_job = None
+        self._paint(w, h)
         try:
-            self.itemconfigure(self._win, width=max(1, e.width - self._padx * 2 - self._bw * 2))
+            self.itemconfigure(self._win, width=max(1, w - self._padx * 2 - self._bw * 2))
             if self._fill:
-                self.itemconfigure(
-                    self._win, height=max(1, e.height - self._pady * 2 - self._bw * 2)
-                )
+                self.itemconfigure(self._win, height=max(1, h - self._pady * 2 - self._bw * 2))
         except tk.TclError:
             pass
 
@@ -422,69 +525,74 @@ class RoundedCard(tk.Canvas):
             return
         bw = self._bw
         line = self._border_hover if self._hover else self._border
+        shadow = "s2" if (self._shadow and self._hover) else self._shadow
         self.delete("frame")
         self.delete("rail")
-        if bw:
-            _round_rect(self, bw / 2, bw / 2, w - bw / 2, h - bw / 2, self._r,
-                        fill=self._bg, outline=line, width=bw, tags="frame")
-        else:
-            _round_rect(self, 0, 0, w, h, self._r,
-                        fill=self._bg, outline="", width=0, tags="frame")
-        self.tag_lower("frame")   # 背景压到内嵌窗口下面
+        self._refs = round_box(self, bw, bw, w - bw, h - bw, self._r,
+                               fill=self._bg, outline=line, width=bw,
+                               shadow=shadow, tags="frame")
+        self.tag_lower("frame")
         if self._rail:
-            # 只在圆角的直边段里画，碰不到四个圆角，所以不会和圆角打架
-            x0 = bw + 3
-            y0 = self._r * 0.6
-            y1 = h - self._r * 0.6
+            x0 = bw + 4
+            y0 = self._r * 0.5
+            y1 = h - self._r * 0.5
             if y1 - y0 > self._rail_w * 2:
-                _round_rect(self, x0, y0, x0 + self._rail_w, y1, self._rail_w / 2,
-                            fill=self._rail, outline="", width=0, tags="rail")
+                round_box(self, x0, y0, x0 + self._rail_w, y1, self._rail_w / 2,
+                          fill=self._rail, outline="", width=0, tags="rail")
                 self.tag_raise("rail")
 
 
 # ── 状态胶囊 ────────────────────────────────────────────────────────────────
-_PILL = {
-    "on":   {"bg": GREEN_BG, "fg": GREEN_DK, "dot": GREEN},
-    "off":  {"bg": GRAY_BG,  "fg": SUBTLE,   "dot": GRAY_DOT},
-    "warn": {"bg": AMBER_BG, "fg": AMBER,    "dot": AMBER},
-}
+def _pill_style(t, kind: str) -> dict:
+    return {
+        "on":    {"bg": t.success_bg,  "fg": t.success_fg, "dot": t.success},
+        "off":   {"bg": t.inset,       "fg": t.label2,     "dot": t.decor},
+        "warn":  {"bg": t.warn_bg,     "fg": t.warn_fg,    "dot": t.warn},
+        "error": {"bg": t.error_bg,    "fg": t.error_fg,   "dot": t.error},
+        "busy":  {"bg": t.brand_wash,  "fg": t.brand,      "dot": t.brand},
+    }.get(kind, {"bg": t.inset, "fg": t.label2, "dot": t.decor})
 
 
 class Pill(tk.Canvas):
-    """状态胶囊：圆点 + 文字，全圆角。kind = on / off / warn。"""
+    """状态胶囊：圆点 + 文字，全圆角。kind = on / off / warn / error / busy。"""
 
-    H = 23
+    H = 24
 
     def __init__(self, master, text: str = "", kind: str = "on",
                  bg: str | None = None, **kw) -> None:
-        self._text = text
-        self._kind = kind
-        self._pal = _PILL.get(kind, _PILL["off"])
+        self._t = theme()
+        self._text, self._kind = text, kind
+        self._pal = _pill_style(self._t, kind)
         self._owner_bg = bg or _parent_bg(master)
-        self._font = tkfont.Font(family=FONT_UI, size=9, weight="bold")
-        w = int(self._font.measure(text) + 9 * 2 + 6 + 5 + 4)
-        super().__init__(master, width=w, height=self.H, bg=self._owner_bg,
+        self._font = tkfont.Font(family=FONT_UI, size=FS["sm"], weight="bold")
+        self._refs: list = []
+        super().__init__(master, width=self._width(), height=self.H, bg=self._owner_bg,
                          highlightthickness=0, bd=0, **kw)
         self._draw()
+
+    def _width(self) -> int:
+        return int(self._font.measure(self._text) + SP["sm"] * 2 + 8 + SP["xs"] + 4)
 
     def _draw(self) -> None:
         self.delete("all")
         w, h = int(self.cget("width")), self.H
-        _round_rect(self, 0, 0, w, h, h / 2, fill=self._pal["bg"], outline="", width=0)
+        self._refs = round_box(self, 0, 0, w - 1, h - 1, h / 2,
+                               fill=self._pal["bg"], outline="", width=0)
         cy = h / 2
-        self.create_oval(9, cy - 3, 15, cy + 3, fill=self._pal["dot"], outline="")
-        self.create_text(20, cy + 0.5, text=self._text, fill=self._pal["fg"],
+        self.create_oval(SP["sm"] + 1, cy - 3, SP["sm"] + 7, cy + 3,
+                         fill=self._pal["dot"], outline="")
+        self.create_text(SP["sm"] + 12, cy + 0.5, text=self._text, fill=self._pal["fg"],
                          font=self._font, anchor="w")
 
     def configure(self, cnf=None, **kw):  # type: ignore[override]
-        if isinstance(cnf, dict):           # 支持 widget.configure({"text": "x"}) 这种老写法
+        if isinstance(cnf, dict):
             kw = {**cnf, **kw}
         if "text" in kw:
             self._text = kw.pop("text")
-            kw["width"] = int(self._font.measure(self._text) + 9 * 2 + 6 + 5 + 4)
+            kw["width"] = self._width()
         if "kind" in kw:
             self._kind = kw.pop("kind")
-            self._pal = _PILL.get(self._kind, _PILL["off"])
+            self._pal = _pill_style(self._t, self._kind)
         if kw:
             super().configure(**kw)
         self._draw()
@@ -502,58 +610,57 @@ class Pill(tk.Canvas):
 
 
 # ── 标签芯片 ────────────────────────────────────────────────────────────────
-_CHIP = {
-    "ver": {"bg": "#F3F4F6", "fg": "#6B7280", "line": "#E5E7EB", "mono": True},
-    "primary": {"bg": ACCENT, "fg": "#FFFFFF", "line": "", "mono": False},
-    "soft": {"bg": ACCENT_WASH, "fg": ACCENT_DK, "line": "#E1E7FF", "mono": False},
-    # 键位提示：中性灰，像键盘帽，不像按钮
-    "key": {"bg": "#F4F5F7", "fg": "#4B5563", "line": "#E1E4E8", "mono": False},
-    # 本机已经装了的那一版
-    "ok": {"bg": GREEN_BG, "fg": GREEN_DK, "line": "#CDEBD9", "mono": True},
-}
+def _chip_style(t, kind: str) -> dict:
+    return {
+        "ver":     {"bg": t.inset,      "fg": t.label2,     "line": t.line1,     "mono": True},
+        "primary": {"bg": t.brand,      "fg": t.on_brand,   "line": "",          "mono": False},
+        "soft":    {"bg": t.brand_wash, "fg": t.brand,      "line": t.brand_line, "mono": False},
+        "key":     {"bg": t.inset,      "fg": t.label2,     "line": t.line1,     "mono": False},
+        "ok":      {"bg": t.success_bg, "fg": t.success_fg, "line": t.success_line, "mono": True},
+        "warn":    {"bg": t.warn_bg,    "fg": t.warn_fg,    "line": t.warn_line, "mono": False},
+    }.get(kind, {"bg": t.inset, "fg": t.label2, "line": t.line1, "mono": True})
 
 
 class Chip(tk.Canvas):
-    """标签芯片：版本号用 kind="ver"（等宽字），"★ 主要版本" 用 kind="primary"。"""
+    """标签芯片：版本号 kind="ver"（等宽），"★ 主要版本" kind="primary"。"""
 
-    H = 20
+    H = 22
 
     def __init__(self, master, text: str = "", kind: str = "ver",
                  bg: str | None = None, **kw) -> None:
-        self._text = text
-        self._kind = kind
-        self._pal = _CHIP.get(kind, _CHIP["ver"])
+        self._t = theme()
+        self._text, self._kind = text, kind
+        self._pal = _chip_style(self._t, kind)
         self._owner_bg = bg or _parent_bg(master)
         self._font = tkfont.Font(
             family=(FONT_MONO if self._pal["mono"] else FONT_UI),
-            size=9, weight=("normal" if self._pal["mono"] else "bold"),
+            size=FS["sm"], weight=("normal" if self._pal["mono"] else "bold"),
         )
-        w = int(self._font.measure(text) + 6 * 2 + 5)
-        super().__init__(master, width=w, height=self.H, bg=self._owner_bg,
+        self._refs: list = []
+        super().__init__(master, width=self._width(), height=self.H, bg=self._owner_bg,
                          highlightthickness=0, bd=0, **kw)
         self._draw()
+
+    def _width(self) -> int:
+        return int(self._font.measure(self._text) + SP["sm"] * 2 + 1)
 
     def _draw(self) -> None:
         self.delete("all")
         w, h = int(self.cget("width")), self.H
-        line = self._pal["line"]
-        if line:
-            _round_rect(self, 0.5, 0.5, w - 0.5, h - 0.5, 5,
-                        fill=self._pal["bg"], outline=line, width=1)
-        else:
-            _round_rect(self, 0, 0, w, h, 5, fill=self._pal["bg"], outline="", width=0)
+        self._refs = round_box(self, 0, 0, w - 1, h - 1, RAD["xs"],
+                               fill=self._pal["bg"], outline=self._pal["line"], width=1)
         self.create_text(w / 2, h / 2 + 0.5, text=self._text, fill=self._pal["fg"],
                          font=self._font, anchor="center")
 
     def configure(self, cnf=None, **kw):  # type: ignore[override]
-        if isinstance(cnf, dict):           # 支持 widget.configure({"text": "x"}) 这种老写法
+        if isinstance(cnf, dict):
             kw = {**cnf, **kw}
         if "text" in kw:
             self._text = kw.pop("text")
-            kw["width"] = int(self._font.measure(self._text) + 6 * 2 + 5)
+            kw["width"] = self._width()
         if "kind" in kw:
             self._kind = kw.pop("kind")
-            self._pal = _CHIP.get(self._kind, _CHIP["ver"])
+            self._pal = _chip_style(self._t, self._kind)
         if kw:
             super().configure(**kw)
         self._draw()
@@ -572,19 +679,16 @@ class Chip(tk.Canvas):
 
 # ── 极简滚动条 ──────────────────────────────────────────────────────────────
 class MiniScrollbar(tk.Canvas):
-    """没有箭头、没有槽边框的一根圆角滑块。
+    """没有箭头、没有槽边框的一根圆角滑块。接口同 tk.Scrollbar。
 
-    为什么不用 ttk.Scrollbar：Windows 主题下的滚动条带上下箭头和凹陷槽，
-    和圆角按钮、圆角卡片完全不是一个时代的东西。整块界面里最显眼的"老气"就来自它。
-
-    接口和 tk.Scrollbar 一致，换上去只改两行：
         sb = MiniScrollbar(parent, command=text.yview)
         text.configure(yscrollcommand=sb.set)
 
-    内容没超出时不画滑块（不占视觉），悬停加深，支持拖动和点槽翻页。
+    内容装得下时不画滑块；悬停加深；支持拖动与点槽翻页。
     """
 
-    def __init__(self, master, command=None, bg: str | None = None, width: int = 11, **kw) -> None:
+    def __init__(self, master, command=None, bg: str | None = None, width: int = 12, **kw) -> None:
+        self._t = theme()
         self._cmd = command
         self._first, self._last = 0.0, 1.0
         self._owner_bg = bg or _parent_bg(master)
@@ -599,7 +703,6 @@ class MiniScrollbar(tk.Canvas):
         self.bind("<B1-Motion>", self._drag)
         self.bind("<ButtonRelease-1>", self._release)
 
-    # ── 对内嵌控件暴露的接口（同 tk.Scrollbar）──
     def set(self, first, last) -> None:
         try:
             first, last = float(first), float(last)
@@ -613,7 +716,6 @@ class MiniScrollbar(tk.Canvas):
     def get(self) -> tuple:
         return self._first, self._last
 
-    # ── 几何 ──
     def _track(self) -> tuple:
         h = max(1, int(self.winfo_height()))
         pad = 3
@@ -623,9 +725,9 @@ class MiniScrollbar(tk.Canvas):
         pad, track = self._track()
         y0 = pad + track * self._first
         y1 = pad + track * self._last
-        if y1 - y0 < 22:                    # 内容再长也留一个抓得住的滑块
+        if y1 - y0 < 24:                      # 内容再长也留一个抓得住的滑块
             y1 = pad + track
-            y0 = max(pad, y1 - 22)
+            y0 = max(pad, y1 - 24)
         return y0, y1
 
     def _set_hover(self, on: bool) -> None:
@@ -639,17 +741,17 @@ class MiniScrollbar(tk.Canvas):
         if w < 6 or h < 24:
             return
         if self._last - self._first >= 0.999:
-            return                          # 一屏装得下：不画
+            return
         y0, y1 = self._thumb()
-        _round_rect(self, 3, y0, w - 3, y1, (w - 6) / 2,
-                    fill=(MUTED if self._hover else GRAY_DOT), outline="", width=0)
+        round_box(self, 3, y0, w - 3, y1, (w - 6) / 2,
+                  fill=(self._t.thumb_hover if self._hover else self._t.thumb),
+                  outline="", width=0)
 
-    # ── 拖动 ──
     def _press(self, e) -> None:
         y0, y1 = self._thumb()
         if y0 <= e.y <= y1:
             self._grab_off = e.y - y0
-        else:                               # 点槽：滑块中心跳到指针处，再继续拖
+        else:
             self._grab_off = (y1 - y0) / 2
             self._moveto(e.y - self._grab_off)
 
@@ -665,21 +767,20 @@ class MiniScrollbar(tk.Canvas):
         if not callable(self._cmd):
             return
         pad, track = self._track()
-        y0, y1 = self._thumb()
-        room = max(1.0, track - (y1 - y0))
+        _y0, y1 = self._thumb()
+        room = max(1.0, track - (y1 - _y0))
         frac = (thumb_top - pad) / room
         try:
             self._cmd("moveto", max(0.0, min(1.0, frac)))
         except Exception:
             pass
 
-    # ── 兼容 tk.Scrollbar 的配置写法：sb.configure(command=widget.yview) ──
     def configure(self, cnf=None, **kw):  # type: ignore[override]
-        if isinstance(cnf, dict):           # 支持 widget.configure({"text": "x"}) 这种老写法
+        if isinstance(cnf, dict):
             kw = {**cnf, **kw}
         if "command" in kw:
             self._cmd = kw.pop("command")
-        kw.pop("orient", None)      # 只有一个方向，传了也忽略
+        kw.pop("orient", None)
         if kw:
             super().configure(**kw)
         self._draw()
@@ -695,3 +796,104 @@ class MiniScrollbar(tk.Canvas):
     def __getitem__(self, key):
         return self.cget(key)
 
+
+# ── 海面背景 ────────────────────────────────────────────────────────────────
+_BG_CACHE: dict = {}
+
+
+def ocean_image(w: int, h: int, name: str | None = None):
+    """渲染"海面光晕"背景：底色纵向渐变 + 三处径向光（品牌蓝/青/薄荷）。
+
+    同源 dafy-whale-theme 的 .dafy-wash（30% / 26% / 14%，soft-light 叠加）。
+    这里用 alpha 叠加近似同一观感（Tk 没有 mix-blend-mode）。
+    """
+    if not _HAS_PIL or w < 8 or h < 8:
+        return None
+    key = (w, h, name or THEME)
+    hit = _BG_CACHE.get(key)
+    if hit is not None:
+        return hit
+    t = palette(name or THEME)
+    img = Image.new("RGB", (w, h), t.bg_base)
+    d = ImageDraw.Draw(img)
+    # 纵向渐变：上浅下深，像从水面往下看
+    deep = mix(t.bg_base, t.layer2, 0.75)
+    for y in range(h):
+        d.line([(0, y), (w, y)], fill=mix(t.bg_base, deep, y / max(1, h - 1)))
+
+    specs = (   # (中心x比例, 中心y比例, 宽, 高, 颜色, 强度)
+        (0.88, -0.04, 1.5, 1.15, GLOW[0], 0.30),
+        (-0.04, 1.06, 1.24, 1.05, GLOW[1], 0.26),
+        (0.50, 0.46, 0.72, 0.62, GLOW[2], 0.14),
+    )
+    n = 128
+    for cx, cy, rw, rh, color, alpha in specs:
+        # 解析式径向衰减：边缘严格为 0，不会像"模糊椭圆"那样在包围盒边留硬棱
+        mask = Image.new("L", (n, n), 0)
+        px = mask.load()
+        half = (n - 1) / 2
+        for j in range(n):
+            dy = (j - half) / half
+            for i in range(n):
+                dx = (i - half) / half
+                d = math.hypot(dx, dy)
+                if d < 1.0:
+                    px[i, j] = int(255 * alpha * (1.0 - d) ** 1.6)
+        mw, mh = max(2, int(w * rw)), max(2, int(h * rh))
+        mask = mask.resize((mw, mh), Image.LANCZOS)
+        # 显式求交：Image.paste 带负偏移或超出画布时裁区行为不可靠，会留硬边
+        x0, y0 = int(w * cx - mw / 2), int(h * cy - mh / 2)
+        dx0, dy0 = max(0, x0), max(0, y0)
+        dx1, dy1 = min(w, x0 + mw), min(h, y0 + mh)
+        if dx1 <= dx0 or dy1 <= dy0:
+            continue
+        patch_mask = mask.crop((dx0 - x0, dy0 - y0, dx1 - x0, dy1 - y0))
+        img.paste(Image.new("RGB", (dx1 - dx0, dy1 - dy0), color), (dx0, dy0), patch_mask)
+    if len(_BG_CACHE) > 8:
+        _BG_CACHE.clear()
+    _BG_CACHE[key] = img
+    return img
+
+
+class OceanBackdrop(tk.Canvas):
+    """铺满父容器的海面背景。当作底层：先 place/pack 它，再把内容放上面。
+
+    Tk 的 Frame 不透明，所以光晕只会在卡片之间的缝隙里露出来 —— 这正是想要的效果：
+    内容浮在海水上。窗口 resize 后 120ms 重建一次，重建有缓存。
+    """
+
+    def __init__(self, master, theme: str | None = None, **kw) -> None:
+        self._name = theme or THEME
+        t = palette(self._name)
+        super().__init__(master, bg=t.bg_base, highlightthickness=0, bd=0, **kw)
+        self._job = None
+        self._img = None
+        self.bind("<Configure>", self._on_resize)
+
+    def _on_resize(self, e) -> None:
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+        self._job = self.after(120, lambda: self._paint(e.width, e.height))
+
+    def _paint(self, w: int, h: int) -> None:
+        self._job = None
+        img = ocean_image(w, h, self._name)
+        self.delete("bg")
+        if img is None:                      # 没有 Pillow：退化成纯色
+            t = palette(self._name)
+            self.configure(bg=t.bg_base)
+            return
+        self._img = ImageTk.PhotoImage(img)
+        self.create_image(0, 0, image=self._img, anchor="nw", tags="bg")
+        self.tag_lower("bg")
+
+
+def ocean_swatch(w: int, h: int, name: str | None = None):
+    """给标题栏/侧栏之类的小条渲染一块「海面切片」，返回 PhotoImage 或 None。"""
+    img = ocean_image(w, h, name)
+    if img is None:
+        return None
+    return ImageTk.PhotoImage(img)
