@@ -933,6 +933,12 @@ def ocean_image(w: int, h: int, name: str | None = None):
     """
     if not _HAS_PIL or w < 8 or h < 8:
         return None
+    if getattr(palette(name or THEME), "flat", False):
+        # 平色主题（v0.3.8）：整窗背景就是一块 bg_base，一张图都不生成。
+        # 返回 None 是所有调用方都认的"退化成纯色"信号：
+        #   OceanBackdrop._paint     -> configure(bg=bg_base)
+        #   ocean_crop / ocean_slice -> 调用方跳过贴图，露出控件自己的底色
+        return None
     _ensure_root()
     key = (w, h, name or THEME)
     hit = _BG_CACHE.get(key)

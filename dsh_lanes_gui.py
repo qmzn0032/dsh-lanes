@@ -83,6 +83,11 @@ def apply_theme(name: str) -> None:
 
 apply_theme(_saved_theme())
 
+# ── 版本号：窗口标题和状态条都会打出它 ──────────────────────────────────────
+# 加这个的原因很实在：你会怀疑"我开的和你的不是同一版"，而界面上原来没有任何
+# 版本标识 —— 只能靠背景色猜。以后打开先看右下角/标题栏这几个字，一眼对上。
+APP_VERSION = "v0.3.8"
+
 FONT_UI = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
 
@@ -475,7 +480,7 @@ class LauncherApp:
         self._wheel_acc = 0           # 滚轮增量累积（高精度滚轮一格只报 30~40）
         self._redraw_job = None       # 滚动后标记重画的 idle 任务（见 redraw_windows）
 
-        root.title("DSH 多版本启动器")
+        root.title(f"DSH 多版本启动器  ·  {APP_VERSION}")
         root.configure(bg=BG)
         g_ui = self.cfg.get("ui") or {}
         if g_ui.get("w") and g_ui.get("h"):
@@ -868,7 +873,7 @@ class LauncherApp:
             # 日志区做成**凹进去的水槽**：整块卡片全白的话，右栏就是一大片白纸，
             # 和左边的海水/白卡片是两种材质（这就是"割裂"）。用水色垫底之后，
             # 它读起来像卡片上开了一扇看水的窗，两种材质是同一套。
-            bg=_T.inset,
+            bg=_T.well,
             fg=TEXT,
             relief="flat",
             bd=0,
@@ -886,7 +891,7 @@ class LauncherApp:
             state="disabled",
         )
         self.log_text.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
-        self.log_sb = ui.MiniScrollbar(wrap, command=self.log_text.yview, bg=_T.inset)
+        self.log_sb = ui.MiniScrollbar(wrap, command=self.log_text.yview, bg=_T.well)
         self.log_sb.grid(row=2, column=1, sticky="ns", padx=(0, 4), pady=(6, 0))
         self.log_text.configure(yscrollcommand=self.log_sb.set)
 
@@ -905,18 +910,18 @@ class LauncherApp:
             )
 
         # 空状态：日志一条都没有时，别让面板塌成一张白纸
-        self._log_hint = tk.Frame(wrap, bg=_T.inset)
-        tk.Label(self._log_hint, text="还没有日志", bg=_T.inset, fg=TEXT,
+        self._log_hint = tk.Frame(wrap, bg=_T.well)
+        tk.Label(self._log_hint, text="还没有日志", bg=_T.well, fg=TEXT,
                  font=(FONT_UI, 11, "bold")).pack()
         tk.Label(
             self._log_hint,
             text="打开任意版本、刷新，或做一次操作，\n输出会实时出现在这里。",
-            bg=_T.inset, fg=MUTED, font=(FONT_UI, 9), justify="center",
+            bg=_T.well, fg=MUTED, font=(FONT_UI, 9), justify="center",
         ).pack(pady=(5, 11))
-        keys = tk.Frame(self._log_hint, bg=_T.inset)
+        keys = tk.Frame(self._log_hint, bg=_T.well)
         keys.pack()
         for key_text in ("F5 刷新", "Ctrl+L 清空", "Ctrl+N 新建"):
-            ui.Chip(keys, key_text, "key", bg=_T.inset).pack(side="left", padx=3)
+            ui.Chip(keys, key_text, "key", bg=_T.well).pack(side="left", padx=3)
         self._show_log_hint()
 
         # 自动滚动：手动往上翻就停住，右下角浮出「回到最新」，而不是每来一行把你拽回底部
@@ -937,6 +942,10 @@ class LauncherApp:
         bar = card.inner
         self.status = tk.Label(bar, text="就绪", bg=CARD, fg=MUTED, font=(FONT_UI, 9), anchor="w")
         self.status.pack(side="left")
+        # 版本号常驻左下角：以后"我开的是不是最新"不用再靠背景色猜
+        self.ver_label = tk.Label(bar, text=APP_VERSION, bg=CARD, fg=ui.SUBTLE,
+                                  font=(FONT_UI, 8))
+        self.ver_label.pack(side="left", padx=(10, 0))
         self.busy_label = tk.Label(bar, text="", bg=CARD, fg=ACCENT, font=(FONT_UI, 9, "bold"))
         self.busy_label.pack(side="right")
         self.counts = tk.Label(bar, text="", bg=CARD, fg=MUTED, font=(FONT_UI, 9))

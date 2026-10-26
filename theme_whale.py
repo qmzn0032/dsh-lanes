@@ -82,63 +82,67 @@ def contrast(a: str, b: str) -> float:
 # 色相全部锁在同一个蓝家族里（品牌蓝 226° 一带），两套主题只是**明度不同**，
 # 不换色相 —— 这是"两种模式像同一个产品"的前提。
 #
-# 每个主题除了常规语义色，还带一组**海水**（water_*）：整窗背景那片渐变用它，
-# 而且有一条硬关系（见 check_contrast 末尾）：
-#     卡片(layer1) 永远比 海水最亮处 更亮
-# 浅海是"白卡片浮在浅蓝水面上"，深海是"亮一档的深蓝卡片浮在更深的蓝水里"。
-# 两边关系一致，切换时才是"同一片海换了个天色"，而不是两套皮肤。
+# v0.3.8：**回到 v0.3.1~v0.3.3 那套平色。**
+# 你在截图里指着要的那两版（浅海 #E9F3FC 底 + #F3F9FE 卡片，深海 #0A1428 底 +
+# #0F1E38 卡片）根本没有海面渲染 —— 背景就是一整块纯色。v0.3.4 我加的"纵向渐变
+# + 三处光斑"是我脑子里的海，不是你要的；它还把日志槽做成了凹进去的水槽，整窗
+# 看着就"两套材质打架"。
+#
+# 所以这里把 water_* 三档全钉成 bg_base、vignette/glow 归零，并标 "flat": True：
+# ui_kit.ocean_image 见到 flat 直接返回 None，窗口背景退化成一块 bg_base
+# （OceanBackdrop._paint 里本来就有这条退路），跟你截图逐像素一致。
+# 顺带把"改尺寸要重画一张海面图"这整类隐患一起去掉了。
+#
+# 想再看回渐变：把 water_top/bottom/edge 改回不同值、vignette 与 glow 给非零、
+# 删掉 "flat": True 即可，ui_kit 会自己恢复渲染，别的代码一行都不用动。
 _RAW = {
     "light": {
+        "flat":      True,
         "brand":     "#3B62F6",
-        "bg_base":   "#E4EFFB",
-        "layer1":    "#FBFDFF",
-        "layer2":    "#E9F2FC",
+        "bg_base":   "#E9F3FC",
+        "layer1":    "#F3F9FE",
+        "layer2":    "#E0EDF9",
         "overlay":   "#FFFFFF",
-        "line1":     "#CFE1F3",
-        "line2":     "#A6C4E4",
-        "label1":    "#0E2340",
-        "label2":    "#46678F",
+        "line1":     "#C6DCF2",
+        "line2":     "#9FC3E8",
+        "label1":    "#0E2A5C",
+        "label2":    "#45678F",
         "success":   "#1F9D72",
         "warn":      "#B97A1E",
         "error":     "#D6456D",
         "sidebar":   "#DCE9F8",
         "on_brand":  "#FFFFFF",
-        "shadow":    "#12386C",
-        # 海水：上浅下深 + 四周压深，最深的是窗边那一圈。
-        # v0.3.6 退回 v0.3.4 的这套值。v0.3.5 曾经整体压深一档（想解决"白卡片浮在雾里"），
-        # 结果太重、蓝色抢戏 —— 你要的是"淡淡的、干净的"，不是"更蓝"。所以别再往上调。
-        # 代价是 line1 和 water_bottom 是同一个值：贴着海的卡片描边看不见。
-        # 这是**故意**的（卡片像浮着、不像贴上去的），别当成 bug 再去调深。
-        "water_top":    "#E0ECFA",
-        "water_bottom": "#CFE1F4",
-        "water_edge":   "#B7CDE4",
-        "vignette":     0.55,
-        "glow":         (0.20, 0.18, 0.10),   # 三处光斑强度，对齐 GLOW 的顺序
+        "shadow":    "#0F3C7A",
+        # 平色：三档水色 = 底色，强度归零（只是为了让 ui_kit 的读法不变）
+        "water_top":    "#E9F3FC",
+        "water_bottom": "#E9F3FC",
+        "water_edge":   "#E9F3FC",
+        "vignette":     0.0,
+        "glow":         (0.0, 0.0, 0.0),
     },
     "dark": {
+        "flat":      True,
         "brand":     "#6C8CFF",
-        "bg_base":   "#0A1626",
-        "layer1":    "#17293F",
-        "layer2":    "#0D1B2B",
-        "overlay":   "#1D3251",
-        "line1":     "#294056",
-        "line2":     "#33506F",
-        "label1":    "#E4EEFA",
-        "label2":    "#9DB9D8",
+        "bg_base":   "#0A1428",
+        "layer1":    "#0F1E38",
+        "layer2":    "#0B1830",
+        "overlay":   "#13233F",
+        "line1":     "#1D3252",
+        "line2":     "#2B4A78",
+        "label1":    "#DCEBFF",
+        "label2":    "#8FB0DC",
         "success":   "#4BC49B",
         "warn":      "#E8B45A",
         "error":     "#FF7A93",
         "sidebar":   "#0C1830",
         # 深海下品牌色变亮，白字只有 3.07:1（只够大字），所以压深色字 = 6.0:1
-        "on_brand":  "#0A1626",
+        "on_brand":  "#0A1428",
         "shadow":    "#000000",
-        # 深海的海水：比卡片**更深**（以前反过来 —— 底部的青光比卡片还亮，
-        # 卡片看着像水面上凿出来的洞，这就是"割裂感"的来源之一）
-        "water_top":    "#0B1728",
-        "water_bottom": "#102234",
-        "water_edge":   "#050E18",
-        "vignette":     0.60,
-        "glow":         (0.12, 0.10, 0.06),
+        "water_top":    "#0A1428",
+        "water_bottom": "#0A1428",
+        "water_edge":   "#0A1428",
+        "vignette":     0.0,
+        "glow":         (0.0, 0.0, 0.0),
     },
 }
 
@@ -172,6 +176,12 @@ class Palette:
         self.sidebar    = raw["sidebar"]
         self.shadow     = raw["shadow"]
         self.light      = light
+        # 平色主题：背景不画海面（见 _RAW 顶上的注释）
+        self.flat       = bool(raw.get("flat", False))
+        # 日志槽的底色：**跟卡片同一个色**（v0.3.1~v0.3.3 就是这样）。
+        # v0.3.4 把它做成 inset（暗一档的"水槽"），右栏于是一大片水色，
+        # 跟左边白卡片两种材质 —— 你截图里那版是白的，所以改回来。
+        self.well       = self.layer1
 
         # 海水（整窗背景那片渐变）：ui_kit.ocean_image 直接读这四个值
         self.water_top    = raw["water_top"]
@@ -258,11 +268,6 @@ SHADOW = {
 
 
 # ── 自检：把"看得清"变成可验证的数字 ────────────────────────────────────────
-def _ocean_brightest(t: "Palette") -> str:
-    """海水里最亮的那个位置：顶底色叠上最强的一处光斑（近似，偏保守）。"""
-    return mix(t.water_top, GLOW[0], t.glow[0])
-
-
 def check_contrast(verbose: bool = True) -> list:
     """返回不达标项列表。规则：正文/标签 ≥4.5，非文字（圆点/描边）≥3.0。"""
     pairs = [
@@ -291,26 +296,25 @@ def check_contrast(verbose: bool = True) -> list:
             if not ok:
                 bad.append((theme, label, round(c, 2), need))
 
-        # ── 海水与卡片的关系（不是 WCAG，是"这块界面读不读得懂"）──────────────
-        # 以前两套主题各调各的：浅海卡片比水亮、深海底部的水比卡片还亮 ——
-        # 同一个界面在两种天色下读出来的"上下关系"是反的，切换就有割裂感。
-        # 现在把它写成可验证的约束：卡片永远更亮，窗边那圈永远更深。
-        for label, fg, col, need, must_be_lighter in (
-            ("layer1 比 water_top 亮（卡片浮起）", t.layer1, t.water_top, 1.08, True),
-            ("layer1 比 海水最亮处 亮（光斑不压卡片）", t.layer1, _ocean_brightest(t), 1.06, True),
-            ("water_edge 比 layer1 暗（窗边是深水）", t.layer1, t.water_edge, 1.10, True),
-            # 曾经还有第 4 条「line1 与 water_bottom 可区分（描边不落进海里）」。
-            # v0.3.6 撤掉了：它和"浅海要柔和"是互相打架的 —— 浅海这套值里
-            # line1 和 water_bottom 本来就是同一个色（描边融进海里、卡片像浮着），
-            # 这正是你要的效果。留着这条会一直报红，等于把偏好当成 bug。
+        # ── 底色与卡片的关系（不是 WCAG，是"这块界面读不读得懂"）──────────────
+        # 平色之后只剩一条要紧的：卡片必须比背景亮一档，否则卡片会陷进背景里，
+        # 看不出这是一张卡。浅海实测 1.06、深海 1.11，都压在 1.05 之上。
+        for label, fg, col, need in (
+            ("layer1 比 bg_base 亮（卡片浮起）", t.layer1, t.bg_base, 1.05),
         ):
             c = contrast(fg, col)
-            ok = c >= need
-            if must_be_lighter is not None:
-                ok = ok and (luminance(fg) > luminance(col)) == must_be_lighter
+            ok = c >= need and luminance(fg) > luminance(col)
             rows.append((label, c, need, ok))
             if not ok:
                 bad.append((theme, label, round(c, 2), need))
+
+        # 平色自洽：三档水色必须**等于**底色。不等的话 ocean_image 会走回
+        # 渲染分支，背景就不是一块纯色了 —— 这种"悄悄不平"最难查，写成断言。
+        if t.flat:
+            same = t.water_top == t.water_bottom == t.water_edge == t.bg_base
+            rows.append(("平色：water_* 三档 == bg_base", 1.0 if same else 0.0, 1.0, same))
+            if not same:
+                bad.append((theme, "平色主题的 water_* 必须等于 bg_base", 0.0, 1.0))
         if verbose:
             print(f"\n=== {theme} ===")
             for label, c, need, ok in rows:
