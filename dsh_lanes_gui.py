@@ -152,6 +152,39 @@ def set_dark_titlebar(root: tk.Tk, dark: bool) -> None:
         pass
 
 
+def redraw_windows(*widgets) -> None:
+    """让 Windows 立刻重画这些控件（含子控件，同步完成）。
+
+    为什么非有它不可：左列是个 Canvas，lane 卡片是 canvas 上的「窗口项」——
+    在 Windows 上那是一个**真的子窗口**。滚轮滚动时 Tk 用 ScrollWindowEx 搬像素，
+    被搬到新位置的卡片子窗口不会因此重画，屏幕上就留成一片海面底色：
+    白底和卡片里的文字/按钮全都不见了。用户看到的就是"滚一下，渲染丢了"。
+    （X11 上不会：那边没有真子窗口，都是父窗口画的。）
+
+    修法只有一条：滚动之后按窗口句柄强制 RedrawWindow 一次。参数用
+    INVALIDATE|ERASE|ALLCHILDREN|UPDATENOW —— 同步重画，不会闪一下白。
+    纯外观兜底，任何失败都吞掉，不影响功能。
+    """
+    if os.name != "nt":
+        return
+    try:
+        user32 = ctypes.windll.user32
+    except Exception:
+        return
+    flags = 0x0001 | 0x0004 | 0x0080 | 0x0100   # INVALIDATE | ERASE | ALLCHILDREN | UPDATENOW
+    for widget in widgets:
+        try:
+            hwnd = int(widget.winfo_id())
+        except (tk.TclError, AttributeError, TypeError):
+            continue
+        if not hwnd:
+            continue
+        try:
+            user32.RedrawWindow(ctypes.c_void_p(hwnd), None, None, flags)
+        except Exception:
+            pass
+
+
 class QueueWriter(io.TextIOBase):
     """把核心模块 print 出来的内容按行送进队列，供主线程写进日志面板。"""
 
@@ -426,6 +459,10 @@ class LauncherApp:
         self._list_bg = None          # 左列底图（一张海面切片）；不持引用会被回收
         self._list_bg_job = None
         self._list_size = (0, 0)
+        self._heal_at = 0.0           # 上一次"卡片补画"写日志的时间（防刷屏）
+        self._wheel_acc = 0           # 滚轮增量累积（高精度滚轮一格只报 30~40）
+        self._redraw_job = None       # 滚动后强制重画的 idle 任务（见 redraw_windows）
+        self._redraw_tries = 0
 
         root.title("DSH 多版本启动器")
         root.configure(bg=BG)
@@ -760,18 +797,25 @@ class LauncherApp:
 
         self.canvas = tk.Canvas(left_wrap, bg=BG, highlightthickness=0)
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        sb = ui.MiniScrollbar(left_wrap, command=self.canvas.yview, bg=BG, ocean=True)
+        sb = ui.MiniScrollbar(left_wrap, command=self._scroll_cmd, bg=BG, ocean=True)
         sb.grid(row=0, column=1, sticky="ns", padx=(2, 0))
-        self.canvas.configure(yscrollcommand=sb.set)
+        self._list_sb = sb
+        self._align_job = None
+        self._redraw_job = None
+        self.canvas.configure(yscrollcommand=self._on_list_scroll)
 
         # 列表底：Label 装一张海面切片。
         # 为什么不用 Frame：Tk 的容器全都不透明，Frame 会整片盖住背后的海；
         # Label 的 image 画在**子控件下面**（实测），所以卡片之间的缝里看见的是真海面。
         self.list_frame = tk.Label(self.canvas, bd=0, highlightthickness=0, bg=BG)
         self._win = self.canvas.create_window((0, 0), window=self.list_frame, anchor="nw")
-        self.list_frame.bind("<Configure>", lambda _e: self._layout_list())
+        self.list_frame.bind("<Configure>", self._on_list_configure)
         self.canvas.bind("<Configure>", lambda e: self._layout_list(e.width, e.height))
-        self.canvas.bind_all("<MouseWheel>", self._on_wheel)
+        self._wheel_acc = 0
+        self._list_size = (0, 0)      # 新画布＝还没量过，底图必须重画一次
+        self._layout_job = None       # 布局落定后再量一次滚动区高度
+        self._bind_wheel(self.canvas)
+        self._bind_wheel(self.list_frame)
         self.split.add(left_wrap, minsize=420, stretch="always")
 
         # ── 右：日志 —— 海面垫底 + 一整块白卡（标题栏/清空/复制也在卡片里）
@@ -810,7 +854,10 @@ class LauncherApp:
             wrap,
             width=1,  # 关键：默认 80 字符会撑爆右列、把左列压扁（grid 先满足请求宽度再分权重）
             height=1,
-            bg=CARD,
+            # 日志区做成**凹进去的水槽**：整块卡片全白的话，右栏就是一大片白纸，
+            # 和左边的海水/白卡片是两种材质（这就是"割裂"）。用水色垫底之后，
+            # 它读起来像卡片上开了一扇看水的窗，两种材质是同一套。
+            bg=_T.inset,
             fg=TEXT,
             relief="flat",
             bd=0,
@@ -828,7 +875,7 @@ class LauncherApp:
             state="disabled",
         )
         self.log_text.grid(row=2, column=0, sticky="nsew", pady=(6, 0))
-        self.log_sb = ui.MiniScrollbar(wrap, command=self.log_text.yview, bg=CARD)
+        self.log_sb = ui.MiniScrollbar(wrap, command=self.log_text.yview, bg=_T.inset)
         self.log_sb.grid(row=2, column=1, sticky="ns", padx=(0, 4), pady=(6, 0))
         self.log_text.configure(yscrollcommand=self.log_sb.set)
 
@@ -847,18 +894,18 @@ class LauncherApp:
             )
 
         # 空状态：日志一条都没有时，别让面板塌成一张白纸
-        self._log_hint = tk.Frame(wrap, bg=CARD)
-        tk.Label(self._log_hint, text="还没有日志", bg=CARD, fg=TEXT,
+        self._log_hint = tk.Frame(wrap, bg=_T.inset)
+        tk.Label(self._log_hint, text="还没有日志", bg=_T.inset, fg=TEXT,
                  font=(FONT_UI, 11, "bold")).pack()
         tk.Label(
             self._log_hint,
             text="打开任意版本、刷新，或做一次操作，\n输出会实时出现在这里。",
-            bg=CARD, fg=MUTED, font=(FONT_UI, 9), justify="center",
+            bg=_T.inset, fg=MUTED, font=(FONT_UI, 9), justify="center",
         ).pack(pady=(5, 11))
-        keys = tk.Frame(self._log_hint, bg=CARD)
+        keys = tk.Frame(self._log_hint, bg=_T.inset)
         keys.pack()
         for key_text in ("F5 刷新", "Ctrl+L 清空", "Ctrl+N 新建"):
-            ui.Chip(keys, key_text, "key", bg=CARD).pack(side="left", padx=3)
+            ui.Chip(keys, key_text, "key", bg=_T.inset).pack(side="left", padx=3)
         self._show_log_hint()
 
         # 自动滚动：手动往上翻就停住，右下角浮出「回到最新」，而不是每来一行把你拽回底部
@@ -900,6 +947,112 @@ class LauncherApp:
         # 层级」，要 tagOrId，会直接抛 wrong # args。叠放顺序＝创建顺序，先建就够低了。
         return self._ocean
 
+    def _on_list_scroll(self, first, last) -> None:
+        """滚动位置变了：更新滚动条，并给"垫了海面切片"的卡片重新对位。
+
+        为什么单说这类卡片：它们的底图是从整窗那片海里按自己的屏幕位置裁的，
+        一滚就错位（圆角外面那圈海会跟周围差一档颜色）。滚动**不会**给卡片发
+        <Configure>，所以没法靠事件触发，只能在这里跟着滚动命令刷一次（90ms 去抖，
+        一次滚动只重画一次，不是每格一次）。
+        """
+        try:
+            self._list_sb.set(first, last)
+        except (tk.TclError, AttributeError):
+            pass
+        if self._align_job is not None:
+            try:
+                self.root.after_cancel(self._align_job)
+            except Exception:
+                pass
+        self._align_job = self.root.after(90, self._align_ocean_cards)
+        # Windows 上「滚完卡片变空白」的补丁：等 Tk 把窗口项挪完（idle）再强制重画
+        self._schedule_list_redraw()
+
+    def _schedule_list_redraw(self) -> None:
+        """排一次「强制重画左列」。会连排几次（30/90/180ms）。
+
+        为什么不用 after_idle：Tk 把 canvas 上的窗口项挪位置**也是排到 idle** 里做的，
+        after_idle 排进去比它早，就成了"先补画、后挪窗口"，补了个寂寞。
+        为什么连排几次：左列改高度 → 卡片重排 → 里面折行又变 → 再改高度……
+        这个收敛过程要一两轮，只补一次很容易补在中间。多补两次都是几毫秒的
+        RedrawWindow，比"卡片白了只能重启"便宜太多。
+        """
+        if self._redraw_job is not None:
+            try:
+                self.root.after_cancel(self._redraw_job)
+            except Exception:
+                pass
+        self._redraw_tries = 3
+        self._redraw_job = self.root.after(30, self._repaint_list_after_scroll)
+
+    def _repaint_list_after_scroll(self) -> None:
+        self._redraw_job = None
+        try:
+            self.canvas.update_idletasks()      # 先把 Tk 欠着的挪窗口/重排做完
+        except tk.TclError:
+            return
+        try:
+            kids = [c for c in self.list_frame.winfo_children()
+                    if isinstance(c, ui.RoundedCard) and c.winfo_ismapped()]
+        except tk.TclError:
+            return
+        redraw_windows(self.list_frame, *kids)
+        if self._redraw_tries > 1:
+            self._redraw_tries -= 1
+            self._redraw_job = self.root.after(
+                (3 - self._redraw_tries) * 60, self._repaint_list_after_scroll)
+
+    def _align_ocean_cards(self) -> None:
+        self._align_job = None
+        try:
+            kids = list(self.list_frame.winfo_children())
+        except tk.TclError:
+            return
+        for child in kids:
+            if isinstance(child, ui.RoundedCard) and child._ocean:
+                try:
+                    if child.winfo_ismapped():
+                        child.heal()
+                except tk.TclError:
+                    continue
+
+    def _on_list_configure(self, e) -> None:
+        """左列内容变高/变宽了才重算布局。
+
+        为什么要先比一下尺寸：**滚动 canvas 本身就会给里面的控件发 <Configure>**
+        （只是 x/y 变了）。以前这里无条件跑 _layout_list()，于是"滚一格轮子" =
+        一次重排 + 可能一次整块海面底图重绘，滚起来就一顿一顿的。
+        """
+        if (int(e.width), int(e.height)) == self._list_size:
+            return
+        self._layout_list()
+
+    def _content_height(self) -> int:
+        """左列内容真正有多高。
+
+        不能用 list_frame.winfo_reqheight()：那块底图是画在 Label 上的，
+        设图之后 Label 的 reqheight 就等于**上一张图的高度**，拿它算滚动区
+        等于让底图自己往上反馈 —— 列表只会越长越缩不回来。
+        这里两条路取大：pack 出来的实际底部、卡片自身要求的和（布局还没跑时用得上）。
+        """
+        real = 0
+        asked = 0
+        try:
+            kids = list(self.list_frame.winfo_children())
+        except tk.TclError:
+            return 0
+        for child in kids:
+            try:
+                if child.winfo_ismapped():
+                    real = max(real, int(child.winfo_y()) + int(child.winfo_height()))
+                # 要的是"每张卡自己要求多高"。只看实际摆出来的高度不行：列表装不下时
+                # pack 会把最后一张压扁，于是滚区永远刚好差那一截 —— 底下几行字被裁掉，
+                # 还滚不到（这是"内容到底了、却少一块"的根因）。
+                asked += max(int(child.winfo_reqheight()), int(child.winfo_height())) + CARD_GAP * 2
+            except tk.TclError:
+                continue
+        return max(real, asked)
+
     def _layout_list(self, w: int | None = None, h: int | None = None) -> None:
         """左列布局：内容比视口短时把列表撑满视口（否则底下会露一条纯色），
         同时决定底图要多大，变了才重画（拖动窗口时不会每像素重算一张图）。
@@ -909,7 +1062,7 @@ class LauncherApp:
             ch = int(h if h is not None else self.canvas.winfo_height())
         except tk.TclError:
             return
-        need = max(1, self.list_frame.winfo_reqheight())
+        need = max(1, self._content_height())
         ch2 = max(need, ch)
         try:
             self.canvas.itemconfigure(self._win, width=max(1, cw), height=ch2)
@@ -919,6 +1072,9 @@ class LauncherApp:
         if (cw, ch2) != self._list_size:
             self._list_size = (cw, ch2)
             self._paint_list_bg()
+            # 改窗口项尺寸＝在里面挪动/缩放卡片，Windows 上同样会留下没重画的空白，
+            # 所以这里也要补一次强制重画（不只是滚动时需要）。
+            self._schedule_list_redraw()
 
     def _paint_list_bg(self) -> None:
         if self._list_bg_job is not None:
@@ -1004,22 +1160,70 @@ class LauncherApp:
         except Exception:
             pass
 
-    def _on_wheel(self, event) -> None:
-        # 这个绑定是 bind_all 的，日志面板里滚轮也会冒过来：只有指针真在列表上才滚列表
+    def _bind_wheel(self, widget) -> None:
+        """给控件（连同现在已有的子控件）挂滚轮。卡片是随刷新重建的，所以每次
+        建完卡片要再挂一次 —— 旧的一起销毁了，不会越挂越多。
+        """
         try:
-            w = self.root.winfo_containing(event.x_root, event.y_root)
-        except Exception:
-            w = None
-        while w is not None:
-            if w is self.canvas:
-                break
-            w = getattr(w, "master", None)
-        else:
-            return
-        try:
-            self.canvas.yview_scroll(int(-event.delta / 120), "units")
+            widget.bind("<MouseWheel>", self._on_wheel, add="+")
+            for child in widget.winfo_children():
+                self._bind_wheel(child)
         except tk.TclError:
             pass
+
+    def _on_wheel(self, event) -> str:
+        """滚左列。两种改法都是有原因的：
+
+        ① 不再 bind_all + winfo_containing。全局绑定要靠"指针下面那一刻是哪个
+           控件"反推是列表还是日志，指针压在按钮/胶囊/浮层上时就会判断错、甚至
+           直接丢掉这次滚轮；它还会在日志面板上重复触发一次。
+        ② 认 delta 的累积值。高精度滚轮和触控板一格只报 30~40，以前
+           int(-delta/120) 直接算成 0 —— 表现为"滚了没反应"。
+        """
+        delta = int(getattr(event, "delta", 0) or 0)
+        if not delta:
+            return "break"
+        self._wheel_acc += delta
+        steps = int(self._wheel_acc / 120.0)
+        if not steps:
+            return "break"
+        self._wheel_acc -= steps * 120
+        try:
+            top, bottom = self.canvas.yview()
+            if (steps > 0 and top <= 0.0) or (steps < 0 and bottom >= 1.0):
+                self._wheel_acc = 0          # 到底/到顶，别攒着等会儿一下子跳
+                return "break"
+            self.canvas.yview_scroll(-steps, "units")
+            # 立刻补画：Windows 上滚动是"搬像素"，卡片是真子窗口，搬完不会自己重画
+            self._repaint_list_now()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _scroll_cmd(self, *args) -> None:
+        """给滚动条用的 yview：滚完同样要补画（拖滑块和滚轮走的是两条路）。"""
+        try:
+            self.canvas.yview(*args)
+        except tk.TclError:
+            return
+        self._repaint_list_now()
+
+    def _repaint_list_now(self) -> None:
+        """立刻补画左列（同步）。
+
+        关键是要先 `update_idletasks()`：Tk 把 canvas 上的窗口项挪位置是排到 idle 的，
+        不先把它推完就补画，补的是"挪之前"的位置 —— 等于没补，屏幕上还是空白。
+        """
+        try:
+            self.canvas.update_idletasks()
+        except tk.TclError:
+            return
+        try:
+            kids = [c for c in self.list_frame.winfo_children()
+                    if isinstance(c, ui.RoundedCard) and c.winfo_ismapped()]
+        except tk.TclError:
+            return
+        redraw_windows(self.list_frame, *kids)
 
     # ── 日志 ────────────────────────────────────────────────────────────────
     def _tag_for(self, text: str, tag: str | None = None) -> str:
@@ -1266,20 +1470,65 @@ class LauncherApp:
             )
             # core.ordered_lanes：主要版本永远第一
             for name, data in core.ordered_lanes(self.cfg):
-                card = LaneCard(
-                    self.list_frame,
-                    self,
-                    name,
-                    data,
-                    snap["states"].get(name),
-                    is_primary=(name == top),
-                    primary_name=top,
-                    primary_refs=top_refs,
-                )
+                # 一张卡画失败不能让整列停在那儿：以前循环里抛异常，列表就只剩
+                # 前几张（而且下面几段全没了），看起来像"卡片没了、内容也空了"。
+                try:
+                    card = LaneCard(
+                        self.list_frame,
+                        self,
+                        name,
+                        data,
+                        snap["states"].get(name),
+                        is_primary=(name == top),
+                        primary_name=top,
+                        primary_refs=top_refs,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self.log(f"[XX] lane「{name}」的卡片画不出来："
+                             f"{type(exc).__name__}: {exc}", "warn")
+                    continue
                 card.pack(fill="x", pady=CARD_GAP, padx=LIST_PAD)
+                self._bind_wheel(card)
 
         self._build_foreign_section(snap)
         self._update_counts(snap)
+        # 重建完之后滚区要跟着新内容重算：以前靠 Label 的 <Configure> 顺带跑，
+        # 现在那条路被 _on_list_configure 的尺寸比对挡住了，得显式来一次。
+        for child in self.list_frame.winfo_children():
+            if isinstance(child, ui.RoundedCard):
+                self._watch_card_size(child)
+        self._layout_list()
+        # 再来一次：刚建出来的卡片这一刻还没有真实高度（见 _content_height 的说明），
+        # 等布局落定再量一次，滚动区才不会多出一截空白。
+        if self._layout_job is not None:
+            try:
+                self.root.after_cancel(self._layout_job)
+            except Exception:
+                pass
+        self._layout_job = self.root.after(150, self._relayout_settled)
+
+    def _watch_card_size(self, card) -> None:
+        """卡片高度变了 → 左列滚区重算一次。
+
+        为什么监听卡片而不是等 Label：Label 的窗口项高度是**我们固定给它的**，
+        卡片在里面变高变矮它自己不会变，所以再也不会发 <Configure>。
+        而卡片刚建出来时宽度还是 1px，文字会被折成一长条、高度虚高；
+        等真实宽度下来后高度缩回去，滚区却留在虚高那个值上 ——
+        表现就是"内容早到底了，还能往下滚一大截空白"。
+        """
+        def on_cfg(e, c=card):
+            h = int(e.height)
+            if h == getattr(c, "_watched_h", None):
+                return
+            c._watched_h = h
+            if self._layout_job is None:
+                self._layout_job = self.root.after(120, self._relayout_settled)
+
+        card.bind("<Configure>", on_cfg, add="+")
+
+    def _relayout_settled(self) -> None:
+        self._layout_job = None
+        self._layout_list()
 
     # ── 未登记实例 / 系统全局安装 ───────────────────────────────────────────
     def _section_card(self, text: str, count: int | None = None, action=None) -> tk.Frame:
@@ -1291,6 +1540,7 @@ class LauncherApp:
         card = ui.RoundedCard(self.list_frame, bg=CARD, border=BORDER, radius=10,
                               padx=13, pady=10, ocean=True)
         card.pack(fill="x", pady=(10, CARD_GAP), padx=LIST_PAD)
+        self._bind_wheel(card)
         head = tk.Frame(card.inner, bg=CARD)
         head.pack(fill="x")
         if action is not None:
@@ -1418,7 +1668,47 @@ class LauncherApp:
                 self.refresh_lanes(force=False)
             except Exception:
                 pass
+        self._heal_cards()
         self._tick_id = self.root.after(2500, self._tick)
+
+    def _heal_cards(self) -> None:
+        """对账：每张卡片画的图是不是还跟当前尺寸/位置对得上。
+
+        为什么要有这个：卡片的圆角面是靠 <Configure> + 60ms 去抖画的。只要有一次
+        重画被吞掉（Tk 丢了 Configure、去抖被 after_cancel 掉、PIL 抛异常），
+        界面上就会留一块"旧图"甚至空白卡片 —— 而且它自己永远不会好，只能重启。
+        与其赌"不会发生"，不如每 2.5 秒对一次账：过期就按当前尺寸补画。
+        """
+        fixed = 0
+        try:
+            kids = list(self.list_frame.winfo_children())
+        except tk.TclError:
+            return
+        for child in kids:
+            if not isinstance(child, ui.RoundedCard):
+                continue
+            try:
+                if not child.winfo_ismapped():
+                    continue
+                # 已经排着 60ms 后要重画的，就别插一脚：插进去会和那边互相取消，
+                # 变成"永远在补画"（每 2.5 秒重画一轮，白烧 CPU 还可能闪）。
+                if child._resize_job is not None:
+                    continue
+                # 只补"画的图跟当前尺寸对不上"。**不要**在这里按内容高度去 configure
+                # 卡片高度：卡片自己的 _on_inner 也在管这件事，两边各按各的时刻算，
+                # 会互相改来改去（高度 250↔292 来回跳，卡片就一直画不完）。
+                if child.is_stale():
+                    child.heal()
+                    fixed += 1
+            except (tk.TclError, AttributeError):
+                continue
+        if fixed:
+            self._schedule_list_redraw()
+            now = time.monotonic()
+            if now - self._heal_at > 10:
+                self._heal_at = now
+                self.log(f"[!!] 有 {fixed} 张卡片的重绘没跟上，已按当前尺寸补画。"
+                         f"反复出现的话请把这段发给我。", "warn")
 
     # ── 任务执行（后台线程 + 日志流）────────────────────────────────────────
     def run_job(self, title: str, fn, on_done=None) -> None:
@@ -3280,7 +3570,7 @@ class LauncherApp:
         每次重建都会刷一遍（不是崩溃，但很难看）。
         """
         for attr in ("_poll_id", "_tick_id", "_split_id", "_list_bg_job", "_remote_job",
-                     "_titlebar_job"):
+                     "_titlebar_job", "_align_job", "_redraw_job", "_layout_job"):
             job = getattr(self, attr, None)
             setattr(self, attr, None)
             if job is None:

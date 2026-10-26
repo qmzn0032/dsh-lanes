@@ -467,6 +467,12 @@ class RoundedCard(tk.Canvas):
         self._refs: list = []
         self._ocean_refs: list = []
         self._resize_job = None
+        # 上一张图是按多大尺寸、在屏幕的哪个位置画的。
+        # 为什么记位置：滚动一个 canvas 时，里面每个控件都会发一条 <Configure>，
+        # 但 w/h 一个字都没变 —— 以前这种"只挪了位置"也会重画整块圆角面
+        # （PIL 超采样 + LANCZOS），滚一格轮子就重画四张卡，手感直接卡住。
+        self._painted_size = (0, 0)
+        self._painted_at = None
         super().__init__(master, bg=self._owner_bg, highlightthickness=0, bd=0, **kw)
         self.inner = tk.Frame(self, bg=self._bg)
         self._win = self.create_window(padx, pady, window=self.inner, anchor="nw")
@@ -523,9 +529,22 @@ class RoundedCard(tk.Canvas):
                 pass
         self._resize_job = self.after(60, lambda: self._apply_size(e.width, e.height))
 
+    def _screen_xy(self):
+        """控件左上角的屏幕坐标；取不到就 None。"""
+        try:
+            return (int(self.winfo_rootx()), int(self.winfo_rooty()))
+        except (tk.TclError, AttributeError):
+            return None
+
     def _apply_size(self, w: int, h: int) -> None:
         self._resize_job = None
-        self._paint(w, h)
+        # 只有「尺寸变了」才重画圆角面。垫了海面切片的卡片还要多一条：
+        # 位置变了也得重画，否则切片和整窗那片海对不上（圆角外面会错位）。
+        need = (int(w), int(h)) != self._painted_size
+        if not need and self._ocean:
+            need = self._screen_xy() != self._painted_at
+        if need:
+            self._paint(w, h)
         try:
             self.itemconfigure(self._win, width=max(1, w - self._padx * 2 - self._bw * 2))
             if self._fill:
@@ -533,9 +552,42 @@ class RoundedCard(tk.Canvas):
         except tk.TclError:
             pass
 
+    def is_stale(self) -> bool:
+        """自检用：这张卡画的图是不是还跟当前尺寸对得上。
+
+        只比尺寸，不比位置：垫了海面切片的卡片，位置一变理论上切片就该重算，
+        但滚动时 Tk **不会**给卡片发 <Configure>，靠自检去追位置只会每 2.5 秒
+        白重画一次（而且圆角外面那点错位肉眼看不出来）。滚动后的对位由
+        LauncherApp._on_list_scroll 显式做。
+        """
+        try:
+            now = (int(self.winfo_width()), int(self.winfo_height()))
+        except (tk.TclError, AttributeError):
+            return False
+        return now != self._painted_size
+
+    def heal(self) -> None:
+        """按当前尺寸重画圆角面（自检/滚动后对位时调）。
+
+        只重画那张图，**不动窗口项的宽度**：宽度一改，里面那层 Frame 就会重排，
+        折行一变高度就变，于是又触发"重排 → 挪窗口 → 再重画"，来回抖。
+        """
+        try:
+            w, h = int(self.winfo_width()), int(self.winfo_height())
+        except (tk.TclError, AttributeError):
+            return
+        try:
+            self._paint(w, h)
+        except tk.TclError:
+            pass
+
     def _paint(self, w: int, h: int) -> None:
         if w < 4 or h < 4:
+            # 尺寸还没量出来：记下来，别让自检每次都判成"过期"而反复补画
+            self._painted_size = (int(w), int(h))
             return
+        self._painted_size = (int(w), int(h))
+        self._painted_at = self._screen_xy()
         bw = self._bw
         line = self._border_hover if self._hover else self._border
         shadow = "s2" if (self._shadow and self._hover) else self._shadow

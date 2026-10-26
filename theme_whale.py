@@ -89,27 +89,30 @@ def contrast(a: str, b: str) -> float:
 # 两边关系一致，切换时才是"同一片海换了个天色"，而不是两套皮肤。
 _RAW = {
     "light": {
-        "brand":     "#3B62F6",
-        "bg_base":   "#E4EFFB",
-        "layer1":    "#FBFDFF",
-        "layer2":    "#E9F2FC",
+        "brand":     "#2F5BE0",
+        "bg_base":   "#DCEAF9",
+        "layer1":    "#FDFEFF",
+        "layer2":    "#EDF4FD",
         "overlay":   "#FFFFFF",
-        "line1":     "#CFE1F3",
-        "line2":     "#A6C4E4",
-        "label1":    "#0E2340",
-        "label2":    "#46678F",
+        "line1":     "#C2D8EE",
+        "line2":     "#97B8DC",
+        "label1":    "#0C2040",
+        "label2":    "#3F608A",
         "success":   "#1F9D72",
         "warn":      "#B97A1E",
         "error":     "#D6456D",
         "sidebar":   "#DCE9F8",
         "on_brand":  "#FFFFFF",
-        "shadow":    "#12386C",
-        # 海水：上浅下深 + 四周压深，最深的是窗边那一圈
-        "water_top":    "#E0ECFA",
-        "water_bottom": "#CFE1F4",
-        "water_edge":   "#B7CDE4",
-        "vignette":     0.55,
-        "glow":         (0.20, 0.18, 0.10),   # 三处光斑强度，对齐 GLOW 的顺序
+        "shadow":    "#123A6B",
+        # 海水：上浅下深 + 四周压深，最深的是窗边那一圈。
+        # v0.3.5 整体压深一档、加一点饱和：原来 water_* 太淡，和卡片只差 4% 亮度，
+        # 整窗读起来是"白卡片浮在雾里"——蓝色既不像水也不像底，就成了"割裂"。
+        # 另外 line1(卡片描边) 原来和 water_bottom 是**同一个值**，描边落进海里看不见。
+        "water_top":    "#D2E5F9",
+        "water_bottom": "#AECDEB",
+        "water_edge":   "#88AFD8",
+        "vignette":     0.58,
+        "glow":         (0.22, 0.20, 0.12),   # 三处光斑强度，对齐 GLOW 的顺序
     },
     "dark": {
         "brand":     "#6C8CFF",
@@ -117,7 +120,7 @@ _RAW = {
         "layer1":    "#17293F",
         "layer2":    "#0D1B2B",
         "overlay":   "#1D3251",
-        "line1":     "#25384E",
+        "line1":     "#294056",
         "line2":     "#33506F",
         "label1":    "#E4EEFA",
         "label2":    "#9DB9D8",
@@ -291,13 +294,19 @@ def check_contrast(verbose: bool = True) -> list:
         # 以前两套主题各调各的：浅海卡片比水亮、深海底部的水比卡片还亮 ——
         # 同一个界面在两种天色下读出来的"上下关系"是反的，切换就有割裂感。
         # 现在把它写成可验证的约束：卡片永远更亮，窗边那圈永远更深。
-        for label, col, need, card_lighter in (
-            ("layer1 比 water_top 亮（卡片浮起）", t.water_top, 1.08, True),
-            ("layer1 比 海水最亮处 亮（光斑不压卡片）", _ocean_brightest(t), 1.06, True),
-            ("water_edge 比 layer1 暗（窗边是深水）", t.water_edge, 1.10, True),
+        for label, fg, col, need, must_be_lighter in (
+            ("layer1 比 water_top 亮（卡片浮起）", t.layer1, t.water_top, 1.08, True),
+            ("layer1 比 海水最亮处 亮（光斑不压卡片）", t.layer1, _ocean_brightest(t), 1.06, True),
+            ("water_edge 比 layer1 暗（窗边是深水）", t.layer1, t.water_edge, 1.10, True),
+            # 卡片描边要能从海水里分出来：v0.3.4 的 line1 和 water_bottom 是同一个
+            # 色值，贴着海的卡片边缘等于没有边，白卡片像直接裁出来贴在蓝底上的。
+            # 这条只要"分得开"，不规定谁上谁下（浅海里描边比水亮，深海里也是）。
+            ("line1 与 water_bottom 可区分（描边不落进海里）", t.line1, t.water_bottom, 1.10, None),
         ):
-            c = contrast(t.layer1, col)
-            ok = c >= need and (luminance(t.layer1) > luminance(col)) == card_lighter
+            c = contrast(fg, col)
+            ok = c >= need
+            if must_be_lighter is not None:
+                ok = ok and (luminance(fg) > luminance(col)) == must_be_lighter
             rows.append((label, c, need, ok))
             if not ok:
                 bad.append((theme, label, round(c, 2), need))
