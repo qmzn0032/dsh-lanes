@@ -86,7 +86,7 @@ apply_theme(_saved_theme())
 # ── 版本号：窗口标题和状态条都会打出它 ──────────────────────────────────────
 # 加这个的原因很实在：你会怀疑"我开的和你的不是同一版"，而界面上原来没有任何
 # 版本标识 —— 只能靠背景色猜。以后打开先看右下角/标题栏这几个字，一眼对上。
-APP_VERSION = "v0.3.8"
+APP_VERSION = "v0.3.9"
 
 FONT_UI = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
@@ -158,14 +158,39 @@ def set_dark_titlebar(root: tk.Tk, dark: bool) -> None:
 
 
 # RedrawWindow 的标志位（winuser.h）。抽成常量是为了能被测试读到。
-# 只用 INVALIDATE|ALLCHILDREN，**绝不带 ERASE，也不带 UPDATENOW**：
+# 只用 INVALIDATE，**绝不带 ERASE，也不带 UPDATENOW，也不再带 ALLCHILDREN**：
 #   · ERASE = 先把那块区域擦成窗口类的底色，再让控件画内容。擦和画之间的那一帧
-#     就是用户眼里的"闪"。文档写得很直白：RDW_ERASE 会让窗口先收到 WM_ERASEBKGND。
+#     就是用户眼里的"闪"（v0.3.5 的元凶，v0.3.6 已去掉）。
 #   · UPDATENOW = 在我们的滚动处理里当场同步画完。屏幕上一半是挪过的、一半是旧的，
 #     一次滚动擦十几次，看着就是一格一格地抖。
-# 只要标记"这块脏了"，Windows 会在本轮消息处理完之后合并成一次 WM_PAINT。
+#   · ALLCHILDREN（v0.3.9 试过去掉，结果滚动后卡片里的字会整片消失：子窗口一旦被
+#     滚动作废，只标父窗口唤不回来；实测 heal()/tag_raise() 都救不了）。留着的代价
+#     是每格滚轮 13~60ms，这条成本记在 CHANGELOG 里，以后再想别的办法。
 _RDW_INVALIDATE, _RDW_ERASE, _RDW_ALLCHILDREN, _RDW_UPDATENOW = 0x0001, 0x0004, 0x0080, 0x0100
 _REDRAW_FLAGS = _RDW_INVALIDATE | _RDW_ALLCHILDREN
+
+_GWL_STYLE = -16
+_WS_CLIPCHILDREN = 0x02000000
+
+
+def enable_clip_children(widget) -> None:
+    """给窗口加 WS_CLIPCHILDREN：让 ScrollWindowEx 不去动子窗口。
+
+    为什么非有它不可（v0.3.9）：Tk 在 Windows 上滚动 canvas 用的是 ScrollWindowEx；
+    **没有 WS_CLIPCHILDREN 的窗口**会把子窗口连着像素一起搬走、再擦掉 —— 卡片里的
+    Label/Button 就是真子窗口，于是"滚一下就空白一片"，以前只能靠
+    RedrawWindow(ALLCHILDREN) 把所有子窗口重画一遍来兜（每格 13~60ms）。
+    加上这个样式之后，滚动只搬画布自己，Tk 再按新位置挪窗口项，子窗口内容原样保留。
+    """
+    if os.name != "nt":
+        return
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = int(widget.winfo_id())
+        style = user32.GetWindowLongW(ctypes.c_void_p(hwnd), _GWL_STYLE)
+        user32.SetWindowLongW(ctypes.c_void_p(hwnd), _GWL_STYLE, style | _WS_CLIPCHILDREN)
+    except Exception:
+        pass
 
 
 def redraw_windows(*widgets) -> None:
@@ -819,6 +844,8 @@ class LauncherApp:
         self._align_job = None
         self._redraw_job = None
         self.canvas.configure(yscrollcommand=self._on_list_scroll)
+        # 关键（v0.3.9）：让滚动只搬画布自己，别把卡片这些真子窗口一起搬走擦掉
+        enable_clip_children(self.canvas)
 
         # 列表底：Label 装一张海面切片。
         # 为什么不用 Frame：Tk 的容器全都不透明，Frame 会整片盖住背后的海；
@@ -1006,21 +1033,31 @@ class LauncherApp:
         self._repaint_list_now()
 
     def _align_ocean_cards(self) -> None:
+        """滚动后给"垫了海面切片"的卡片重新对位。
+
+        v0.3.9 起只处理**真的垫了切片**的卡片（`_ocean_refs` 非空）：平色主题里
+        `ocean_slice()` 恒为 None，每张卡都没有切片可对位，以前照样把每张卡
+        `heal()` 一遍（=整块重画），滚动停下后白闪一下。
+        """
         self._align_job = None
         try:
             kids = list(self.list_frame.winfo_children())
         except tk.TclError:
             return
+        healed = 0
         for child in kids:
-            if isinstance(child, ui.RoundedCard) and child._ocean:
-                try:
-                    # 同 _heal_cards：滚动后 ismapped 不可信，按尺寸判断
-                    if child.winfo_width() >= 4 and child.winfo_height() >= 4:
-                        child.heal()
-                except tk.TclError:
-                    continue
+            if not (isinstance(child, ui.RoundedCard) and child._ocean and child._ocean_refs):
+                continue
+            try:
+                # 同 _heal_cards：滚动后 ismapped 不可信，按尺寸判断
+                if child.winfo_width() >= 4 and child.winfo_height() >= 4:
+                    child.heal()
+                    healed += 1
+            except tk.TclError:
+                continue
         # 对位等于"换了一张底图"，换完同样要把子窗口标脏才看得见
-        self._repaint_list_now()
+        if healed:
+            self._repaint_list_now()
 
     def _on_list_configure(self, e) -> None:
         """左列内容变高/变宽了才重算布局。
@@ -1152,7 +1189,12 @@ class LauncherApp:
             pass
 
     def _on_split_release(self, _e=None) -> None:
-        """拖完就存：别等关窗口，万一被强杀也不丢比例。"""
+        """拖完就存：别等关窗口，万一被强杀也不丢比例。
+
+        顺手把"缝亮成品牌蓝"复位：以前只有 <Leave> 才复位，而松手时指针
+        正好还停在缝上 —— 于是那条 12px 的蓝就一直亮着，看起来像被"选中"了。
+        """
+        self._set_sash_hot(False)
         frac = self._split_frac_now()
         if not frac:
             return
@@ -1200,26 +1242,25 @@ class LauncherApp:
                 self._wheel_acc = 0          # 到底/到顶，别攒着等会儿一下子跳
                 return "break"
             self.canvas.yview_scroll(-steps, "units")
-            # 把左列标成脏（只标记，不擦不画）：Windows 上滚动是"搬像素"，
-            # 卡片是真子窗口，搬完不会自己重画。标记一次几微秒，本轮消息处理完
-            # 之后由 Windows 合并成一次 WM_PAINT —— 既不会白，也不会闪。
-            self._repaint_list_now()
+            # 标脏不在这里做：yview_scroll 会触发 yscrollcommand → _on_list_scroll，
+            # 那边统一标一次。两边都标就是每格滚轮标两遍（v0.3.9 实测 12 次/6 格）。
         except tk.TclError:
             pass
         return "break"
 
     def _scroll_cmd(self, *args) -> None:
-        """给滚动条用的 yview：滚完同样要补画（拖滑块和滚轮走的是两条路）。"""
+        """给滚动条用的 yview：标脏交给 _on_list_scroll（yscrollcommand 会回调它）。"""
         try:
             self.canvas.yview(*args)
         except tk.TclError:
             return
-        self._repaint_list_now()
 
     def _repaint_list_now(self) -> None:
-        """把左列（连同里面的卡片）标记成脏，Windows 会合并成一次重画。
+        """把左列标记成脏，Windows 会合并成一次重画。
 
-        只标 list_frame 一张就够：ALLCHILDREN 会递归到里面每一个卡片子窗口。
+        为什么必须带 ALLCHILDREN：卡片里几十个 Label/Button 是真子窗口，滚动作废
+        它们之后，只标父窗口唤不回来（v0.3.9 试过 heal()/tag_raise() 都救不了，
+        实测滚完卡片整片空白）。代价是每格滚轮 11~36ms。
 
         为什么不再 update_idletasks()：那是 v0.3.5"当场同步画"的必需品 ——
         Tk 把窗口项挪位置排在 idle 里，不先推完，同步补画补的是挪之前的位置。

@@ -116,11 +116,15 @@ def font(size: str = "base", bold: bool = False, mono: bool = False) -> tkfont.F
 # ── 渲染层：圆角 + 投影（Pillow 超采样 / 折线兜底）──────────────────────────
 _SS = 3                                   # 超采样倍数：3 倍足够细，内存可控
 _CACHE: dict = {}
-_CACHE_MAX = 700
+# 上限别太小也别太大：键里带精确尺寸，拖动时每换一个宽度就是一个新键。
+# 700 → 240：单张 546×179 的 PhotoImage 约 0.4MB，700 张能顶到几百 MB。
+_CACHE_MAX = 240
+_QUAD_CACHE: dict = {}                    # 四个角的切片缓存（见 corner_quads）
 
 
 def _clear_cache() -> None:
     _CACHE.clear()
+    _QUAD_CACHE.clear()
 
 
 def _rr_points(x1: float, y1: float, x2: float, y2: float, r: float, steps: int = 10) -> list:
@@ -146,6 +150,43 @@ def _round_rect(cv: tk.Canvas, x1, y1, x2, y2, r, fill, outline="", width=1, tag
         *_rr_points(x1, y1, x2, y2, r),
         fill=fill, outline=(outline or fill), width=width, smooth=False, tags=tags,
     )
+
+
+def corner_quads(r: int, fill: str, line: str = "", lw: int = 1):
+    """把一张 2r×2r 的圆角面切成 4 个角（NW/NE/SW/SE），返回 PhotoImage 四元组。
+
+    为什么单独切角：整块圆角面是 O(宽×高) 的 PIL 渲染（超采样 + LANCZOS），
+    一张 546×179 的卡实测 40~90ms —— 拖动时每帧都跟不上，屏幕上就成了
+    "卡片白面比外框小一截、露出一圈底色"。**需要抗锯齿的只有四个角**，
+    切成角缓存住之后，尺寸怎么变都只剩几条直线矩形 + 4 张贴图（约 0.1ms）。
+    """
+    if not _HAS_PIL or int(r) < 2:
+        return None
+    _ensure_root()
+    r = int(r)
+    lw = max(0, int(lw))
+    key = ("q", r, str(fill), str(line or ""), lw)
+    hit = _QUAD_CACHE.get(key)
+    if hit is not None:
+        return hit
+    ss = 3
+    size = r * 2
+    img = Image.new("RGBA", (size * ss, size * ss), (0, 0, 0, 0))
+    ImageDraw.Draw(img).rounded_rectangle(
+        [0, 0, size * ss - 1, size * ss - 1], radius=r * ss,
+        fill=fill, outline=(line or None), width=(max(1, lw) * ss if line else 0),
+    )
+    img = img.resize((size, size), Image.LANCZOS)
+    quads = (
+        ImageTk.PhotoImage(img.crop((0, 0, r, r))),
+        ImageTk.PhotoImage(img.crop((r, 0, size, r))),
+        ImageTk.PhotoImage(img.crop((0, r, r, size))),
+        ImageTk.PhotoImage(img.crop((r, r, size, size))),
+    )
+    if len(_QUAD_CACHE) > 64:
+        _QUAD_CACHE.clear()
+    _QUAD_CACHE[key] = quads
+    return quads
 
 
 def _rgba(color: str, alpha: float) -> tuple:
@@ -176,7 +217,9 @@ def _surface(w: int, h: int, r: int, fill: str, line: str = "", lw: int = 1,
         pad = int(blur * 0.75 + 2)
     W, H = w + pad * 2, h + pad * 2
     # 大面板不必 3 倍超采样：2 倍肉眼已无差别，1 倍只用于超大容器（省内存省时间）
-    ss = _SS if w * h <= 140000 else (2 if w * h <= 420000 else 1)
+    # 阈值 140k → 60k：卡片（约 100k 像素）落进 2 倍这一档，停下来那次重画从
+    # 40~90ms 降到 ~30ms；按钮/胶囊这些小元素仍然 3 倍。
+    ss = _SS if w * h <= 60000 else (2 if w * h <= 420000 else 1)
     img = Image.new("RGBA", (W * ss, H * ss), (0, 0, 0, 0))
 
     if pad:
@@ -473,6 +516,10 @@ class RoundedCard(tk.Canvas):
         # （PIL 超采样 + LANCZOS），滚一格轮子就重画四张卡，手感直接卡住。
         self._painted_size = (0, 0)
         self._painted_at = None
+        # 现在画的是"快版"（角是 AA 贴图、没有投影）还是完整版？
+        # 快版只用在拖动/悬停这种每帧都要画的时刻，停下来 140ms 后补完整版。
+        self._painted_quick = False
+        self._quick_refs: list = []
         super().__init__(master, bg=self._owner_bg, highlightthickness=0, bd=0, **kw)
         self.inner = tk.Frame(self, bg=self._bg)
         self._win = self.create_window(padx, pady, window=self.inner, anchor="nw")
@@ -495,7 +542,14 @@ class RoundedCard(tk.Canvas):
         if on == self._hover:
             return
         self._hover = on
-        self._paint(int(self.winfo_width()), int(self.winfo_height()))
+        # 悬停只是换描边色：先出快版（0.1ms），高质量版排到 140ms 后。
+        # 以前这里直接调 _paint：换颜色＝换缓存键＝一次 40~90ms 的冷渲染，
+        # 鼠标在卡片间来回扫就会一顿一顿的。
+        try:
+            self._paint_quick(int(self.winfo_width()), int(self.winfo_height()))
+        except tk.TclError:
+            return
+        self._schedule_full()
 
     def _check_out(self) -> None:
         try:
@@ -521,13 +575,35 @@ class RoundedCard(tk.Canvas):
             self.configure(height=h)
 
     def _on_resize(self, e) -> None:
-        # 拖动窗口时 <Configure> 会连发；60ms 去抖，避免每像素重建一次图像
+        """尺寸变了：**当场**按此刻的尺寸画一版快版，再排一次完整版。
+
+        以前是 60ms 去抖 + 事件里捕获的 w/h：拖动/改窗口时 <Configure> 每 16~45ms
+        来一次，去抖被无限次取消 → 卡片一直画在旧尺寸上，外面露出一圈底色，
+        看着就是"一闪一闪"（v0.3.9 实测拖动 30 步里有 2.8/4 张卡是这种状态）。
+        现在每帧都画：快版约 0.1ms（4 张 AA 角贴图 + 几条矩形），跟不上的是渲染，
+        不是尺寸。
+        """
+        try:
+            w, h = int(self.winfo_width()), int(self.winfo_height())
+        except tk.TclError:
+            return
+        if w < 4 or h < 4:              # 刚建出来还没量到真实尺寸：用事件里的值兜底
+            w, h = int(getattr(e, "width", w) or w), int(getattr(e, "height", h) or h)
+        # 滚动 canvas 时卡片也会收到 <Configure>，但尺寸一个字都没变 ——
+        # 这种"只挪了位置"不该重画（否则滚完还要白烧一轮 ~30ms 的完整版）。
+        if (w, h) == self._painted_size and not self._painted_quick and not self._ocean:
+            return
+        self._paint_quick(w, h)
+        self._schedule_full()
+
+    def _schedule_full(self, delay: int = 140) -> None:
+        """排一次"完整版"（抗锯齿圆角 + 投影）。连续事件只留最后一次。"""
         if self._resize_job is not None:
             try:
                 self.after_cancel(self._resize_job)
             except Exception:
                 pass
-        self._resize_job = self.after(60, lambda: self._apply_size(e.width, e.height))
+        self._resize_job = self.after(delay, self._apply_size)
 
     def _screen_xy(self):
         """控件左上角的屏幕坐标；取不到就 None。"""
@@ -536,11 +612,22 @@ class RoundedCard(tk.Canvas):
         except (tk.TclError, AttributeError):
             return None
 
-    def _apply_size(self, w: int, h: int) -> None:
+    def _apply_size(self) -> None:
+        """停下来之后：换完整版圆角面，并把内嵌 Frame 的宽度跟着调到最终尺寸。
+
+        内嵌 Frame 的宽度故意留在这里（而不是每帧都改）：改一次宽度＝里面几十个
+        控件重排 + 文字重新折行，那才是拖动时真正贵的一步。快版已经把"卡片白面"
+        画对了，内容重排晚 140ms 看不出来。
+        """
         self._resize_job = None
-        # 只有「尺寸变了」才重画圆角面。垫了海面切片的卡片还要多一条：
-        # 位置变了也得重画，否则切片和整窗那片海对不上（圆角外面会错位）。
-        need = (int(w), int(h)) != self._painted_size
+        try:
+            w, h = int(self.winfo_width()), int(self.winfo_height())
+        except tk.TclError:
+            return
+        if w < 4 or h < 4:
+            return
+        need = (w, h) != self._painted_size or self._painted_quick
+        # 垫了海面切片的卡片还要多一条：位置变了也得重画，否则切片和整窗那片海对不上。
         if not need and self._ocean:
             need = self._screen_xy() != self._painted_at
         if need:
@@ -551,6 +638,58 @@ class RoundedCard(tk.Canvas):
                 self.itemconfigure(self._win, height=max(1, h - self._pady * 2 - self._bw * 2))
         except tk.TclError:
             pass
+
+    def _paint_quick(self, w: int, h: int) -> None:
+        """每帧都能画的那一版：4 个 AA 角 + 直线矩形，**没有投影**。
+
+        角是 2r×2r 圆角面切出来的（见 corner_quads，按 半径/填色/描边 缓存），
+        所以尺寸怎么变都不用重新渲染；抗锯齿和完整版一模一样，只少了那圈投影。
+        """
+        w, h = int(w), int(h)
+        if w < 4 or h < 4:
+            self._painted_size = (w, h)
+            self._painted_quick = True
+            return
+        bw = max(1, int(self._bw))
+        r = int(self._r)
+        # 卡片比圆角还窄的时候（刚建出来那一瞬间）退回完整版：几何算不出来
+        if h < 2 * r + bw * 2 or w < 2 * r + bw * 2:
+            self._paint(w, h)
+            return
+        line = self._border_hover if self._hover else self._border
+        quads = corner_quads(r, self._bg, line, bw)
+        if quads is None:               # 没有 Pillow / 圆角太小：还是走完整版
+            self._paint(w, h)
+            return
+        self.delete("frame")
+        self.delete("rail")
+        self.delete("oceanbg")
+        self._refs = []
+        x0, y0, x1, y1 = bw, bw, w - bw, h - bw
+        fill = self._bg
+        # 中间那条 + 左右两条填色（四个角留空，由贴图补上，露出来的才是页面底色）
+        self.create_rectangle(x0 + r, y0, x1 - r, y1, fill=fill, outline="", tags="frame")
+        self.create_rectangle(x0, y0 + r, x0 + r, y1 - r, fill=fill, outline="", tags="frame")
+        self.create_rectangle(x1 - r, y0 + r, x1, y1 - r, fill=fill, outline="", tags="frame")
+        if line:
+            self.create_rectangle(x0 + r, y0, x1 - r, y0 + bw, fill=line, outline="",
+                                  tags="frame")
+            self.create_rectangle(x0 + r, y1 - bw, x1 - r, y1, fill=line, outline="",
+                                  tags="frame")
+            self.create_rectangle(x0, y0 + r, x0 + bw, y1 - r, fill=line, outline="",
+                                  tags="frame")
+            self.create_rectangle(x1 - bw, y0 + r, x1, y1 - r, fill=line, outline="",
+                                  tags="frame")
+        for xa, ya, img in (
+            (x0, y0, quads[0]), (x1 - r, y0, quads[1]),
+            (x0, y1 - r, quads[2]), (x1 - r, y1 - r, quads[3]),
+        ):
+            self.create_image(xa, ya, image=img, anchor="nw", tags="frame")
+        self._quick_refs = list(quads)  # 贴图必须留活引用，否则角会变空
+        self.tag_lower("frame")
+        self._paint_rail(w, h, bw)
+        self._painted_size = (w, h)
+        self._painted_quick = True
 
     def is_stale(self) -> bool:
         """自检用：这张卡画的图是不是还跟当前尺寸对得上。
@@ -564,7 +703,7 @@ class RoundedCard(tk.Canvas):
             now = (int(self.winfo_width()), int(self.winfo_height()))
         except (tk.TclError, AttributeError):
             return False
-        return now != self._painted_size
+        return now != self._painted_size or self._painted_quick
 
     def heal(self) -> None:
         """按当前尺寸重画圆角面（自检/滚动后对位时调）。
@@ -588,6 +727,8 @@ class RoundedCard(tk.Canvas):
             return
         self._painted_size = (int(w), int(h))
         self._painted_at = self._screen_xy()
+        self._painted_quick = False
+        self._quick_refs = []
         bw = self._bw
         line = self._border_hover if self._hover else self._border
         shadow = "s2" if (self._shadow and self._hover) else self._shadow
