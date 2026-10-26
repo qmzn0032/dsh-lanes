@@ -79,42 +79,62 @@ def contrast(a: str, b: str) -> float:
 
 
 # ── 原语：两套海（亮/暗） ─────────────────────────────────────────────────────
-# 数值全部来自 dafy-whale-theme，未改动；on_brand 是按对比度算出来的。
+# 色相全部锁在同一个蓝家族里（品牌蓝 226° 一带），两套主题只是**明度不同**，
+# 不换色相 —— 这是"两种模式像同一个产品"的前提。
+#
+# 每个主题除了常规语义色，还带一组**海水**（water_*）：整窗背景那片渐变用它，
+# 而且有一条硬关系（见 check_contrast 末尾）：
+#     卡片(layer1) 永远比 海水最亮处 更亮
+# 浅海是"白卡片浮在浅蓝水面上"，深海是"亮一档的深蓝卡片浮在更深的蓝水里"。
+# 两边关系一致，切换时才是"同一片海换了个天色"，而不是两套皮肤。
 _RAW = {
     "light": {
         "brand":     "#3B62F6",
-        "bg_base":   "#E9F3FC",
-        "layer1":    "#F3F9FE",
-        "layer2":    "#E0EDF9",
+        "bg_base":   "#E4EFFB",
+        "layer1":    "#FBFDFF",
+        "layer2":    "#E9F2FC",
         "overlay":   "#FFFFFF",
-        "line1":     "#C6DCF2",
-        "line2":     "#9FC3E8",
-        "label1":    "#0E2A5C",
-        "label2":    "#45678F",
+        "line1":     "#CFE1F3",
+        "line2":     "#A6C4E4",
+        "label1":    "#0E2340",
+        "label2":    "#46678F",
         "success":   "#1F9D72",
         "warn":      "#B97A1E",
         "error":     "#D6456D",
         "sidebar":   "#DCE9F8",
         "on_brand":  "#FFFFFF",
-        "shadow":    "#0F3C7A",
+        "shadow":    "#12386C",
+        # 海水：上浅下深 + 四周压深，最深的是窗边那一圈
+        "water_top":    "#E0ECFA",
+        "water_bottom": "#CFE1F4",
+        "water_edge":   "#B7CDE4",
+        "vignette":     0.55,
+        "glow":         (0.20, 0.18, 0.10),   # 三处光斑强度，对齐 GLOW 的顺序
     },
     "dark": {
         "brand":     "#6C8CFF",
-        "bg_base":   "#0A1428",
-        "layer1":    "#0F1E38",
-        "layer2":    "#0B1830",
-        "overlay":   "#13233F",
-        "line1":     "#1D3252",
-        "line2":     "#2B4A78",
-        "label1":    "#DCEBFF",
-        "label2":    "#8FB0DC",
+        "bg_base":   "#0A1626",
+        "layer1":    "#17293F",
+        "layer2":    "#0D1B2B",
+        "overlay":   "#1D3251",
+        "line1":     "#25384E",
+        "line2":     "#33506F",
+        "label1":    "#E4EEFA",
+        "label2":    "#9DB9D8",
         "success":   "#4BC49B",
         "warn":      "#E8B45A",
         "error":     "#FF7A93",
         "sidebar":   "#0C1830",
         # 深海下品牌色变亮，白字只有 3.07:1（只够大字），所以压深色字 = 6.0:1
-        "on_brand":  "#0A1428",
+        "on_brand":  "#0A1626",
         "shadow":    "#000000",
+        # 深海的海水：比卡片**更深**（以前反过来 —— 底部的青光比卡片还亮，
+        # 卡片看着像水面上凿出来的洞，这就是"割裂感"的来源之一）
+        "water_top":    "#0B1728",
+        "water_bottom": "#102234",
+        "water_edge":   "#050E18",
+        "vignette":     0.60,
+        "glow":         (0.12, 0.10, 0.06),
     },
 }
 
@@ -148,6 +168,13 @@ class Palette:
         self.sidebar    = raw["sidebar"]
         self.shadow     = raw["shadow"]
         self.light      = light
+
+        # 海水（整窗背景那片渐变）：ui_kit.ocean_image 直接读这四个值
+        self.water_top    = raw["water_top"]
+        self.water_bottom = raw["water_bottom"]
+        self.water_edge   = raw["water_edge"]
+        self.vignette     = raw["vignette"]
+        self.glow         = raw["glow"]
 
         # 品牌色三态（暗色下往白走、亮色下往黑走）
         self.brand_hover = mix(self.brand, towards, 0.12)
@@ -227,6 +254,11 @@ SHADOW = {
 
 
 # ── 自检：把"看得清"变成可验证的数字 ────────────────────────────────────────
+def _ocean_brightest(t: "Palette") -> str:
+    """海水里最亮的那个位置：顶底色叠上最强的一处光斑（近似，偏保守）。"""
+    return mix(t.water_top, GLOW[0], t.glow[0])
+
+
 def check_contrast(verbose: bool = True) -> list:
     """返回不达标项列表。规则：正文/标签 ≥4.5，非文字（圆点/描边）≥3.0。"""
     pairs = [
@@ -251,6 +283,21 @@ def check_contrast(verbose: bool = True) -> list:
         for label, fg, bg, need in pairs:
             c = contrast(t[fg], t[bg])
             ok = c >= need
+            rows.append((label, c, need, ok))
+            if not ok:
+                bad.append((theme, label, round(c, 2), need))
+
+        # ── 海水与卡片的关系（不是 WCAG，是"这块界面读不读得懂"）──────────────
+        # 以前两套主题各调各的：浅海卡片比水亮、深海底部的水比卡片还亮 ——
+        # 同一个界面在两种天色下读出来的"上下关系"是反的，切换就有割裂感。
+        # 现在把它写成可验证的约束：卡片永远更亮，窗边那圈永远更深。
+        for label, col, need, card_lighter in (
+            ("layer1 比 water_top 亮（卡片浮起）", t.water_top, 1.08, True),
+            ("layer1 比 海水最亮处 亮（光斑不压卡片）", _ocean_brightest(t), 1.06, True),
+            ("water_edge 比 layer1 暗（窗边是深水）", t.water_edge, 1.10, True),
+        ):
+            c = contrast(t.layer1, col)
+            ok = c >= need and (luminance(t.layer1) > luminance(col)) == card_lighter
             rows.append((label, c, need, ok))
             if not ok:
                 bad.append((theme, label, round(c, 2), need))

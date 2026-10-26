@@ -471,9 +471,19 @@ class RoundedCard(tk.Canvas):
         self.inner = tk.Frame(self, bg=self._bg)
         self._win = self.create_window(padx, pady, window=self.inner, anchor="nw")
         self.bind("<Configure>", self._on_resize)
+        self.bind("<Destroy>", self._on_destroy, add="+")
         self.bind("<Enter>", lambda _e: self.set_hover(True))
         self.bind("<Leave>", lambda _e: self.after(40, self._check_out))
         self.inner.bind("<Configure>", self._on_inner)
+
+    def _on_destroy(self, _e=None) -> None:
+        """被销毁时把排着的重绘取消掉 —— 否则控制台会刷 invalid command name。"""
+        if self._resize_job is not None:
+            try:
+                self.after_cancel(self._resize_job)
+            except Exception:
+                pass
+            self._resize_job = None
 
     def set_hover(self, on: bool) -> None:
         if on == self._hover:
@@ -856,14 +866,18 @@ def clear_cache() -> None:
 
 
 def ocean_image(w: int, h: int, name: str | None = None):
-    """渲染"海面光晕"背景：底色纵向渐变 + 三处径向光（品牌蓝/青/薄荷）。
+    """渲染"海面"背景：上浅下深的底色 + 四周压深 + 三处光斑（品牌蓝/青/薄荷）。
 
-    同源 dafy-whale-theme 的 .dafy-wash（30% / 26% / 14%，soft-light 叠加）。
-    这里用 alpha 叠加近似同一观感（Tk 没有 mix-blend-mode）。
+    色值不写在这里，全部来自主题的 water_top / water_bottom / water_edge /
+    vignette / glow —— 换主题只换一张表。
 
-    渐变要"看得见"才叫铺满整窗：起始色是 bg_base（浅海近白、深海近黑），
-    结束色往青蓝推（浅 22% / 深 30%）。一开始只往 layer2 推 75%，两个色
-    只差 9 个数，渲出来跟纯色没区别 —— 窗口四边露出来的海成了"白边"。
+    为什么要"四周压深"（渐晕）：整窗铺海之后，真正露出来的海只有窗口四边那 16px
+    和卡片之间的缝。只做纵向渐变的话，最上面那条缝正好是最浅的一端（≈ 卡片色），
+    看上去就是"白边"—— 这是第一版铺完整窗还是灰白一片的真正原因。
+    渐晕让窗边那圈永远是深水，卡片才真的像浮着。
+
+    "卡片必须比海水更亮"这条关系由 theme_whale.check_contrast 兜底：
+    深海以前正好反过来（底部青光比卡片亮），卡片看着像水面上凿出来的洞。
     """
     if not _HAS_PIL or w < 8 or h < 8:
         return None
@@ -873,21 +887,27 @@ def ocean_image(w: int, h: int, name: str | None = None):
     if hit is not None:
         return hit
     t = palette(name or THEME)
-    img = Image.new("RGB", (w, h), t.bg_base)
+    img = Image.new("RGB", (w, h), t.water_top)
     d = ImageDraw.Draw(img)
     # 纵向渐变：上浅下深，像从水面往下看
-    deep_c = mix(GLOW[1], GLOW[0], 0.35)            # 青蓝之间，别太艳
-    deep = mix(t.bg_base, deep_c, 0.44 if t.light else 0.42)
     for y in range(h):
-        d.line([(0, y), (w, y)], fill=mix(t.bg_base, deep, y / max(1, h - 1)))
+        d.line([(0, y), (w, y)], fill=mix(t.water_top, t.water_bottom, y / max(1, h - 1)))
 
-    specs = (   # (中心x比例, 中心y比例, 宽, 高, 颜色, 强度)
-        (0.88, -0.04, 1.5, 1.15, GLOW[0], 0.30),
-        (-0.04, 1.06, 1.24, 1.05, GLOW[1], 0.26),
-        (0.50, 0.46, 0.72, 0.62, GLOW[2], 0.14),
+    # 四周压深：Pillow 自带的径向渐变当蒙版，一次 paste 就够（不必逐像素算距离）
+    try:
+        vig = Image.radial_gradient("L").resize((w, h), Image.BILINEAR)
+        vig = vig.point(lambda v: int(v * t.vignette))
+        img.paste(Image.new("RGB", (w, h), t.water_edge), (0, 0), vig)
+    except Exception:
+        pass
+
+    specs = (   # (中心x比例, 中心y比例, 宽, 高, 颜色)
+        (0.88, -0.04, 1.5, 1.15, GLOW[0]),
+        (-0.04, 1.06, 1.24, 1.05, GLOW[1]),
+        (0.50, 0.46, 0.72, 0.62, GLOW[2]),
     )
     n = 128
-    for cx, cy, rw, rh, color, alpha in specs:
+    for (cx, cy, rw, rh, color), alpha in zip(specs, t.glow):
         # 解析式径向衰减：边缘严格为 0，不会像"模糊椭圆"那样在包围盒边留硬棱
         mask = Image.new("L", (n, n), 0)
         px = mask.load()
@@ -994,13 +1014,22 @@ class OceanBackdrop(tk.Canvas):
     """
 
     def __init__(self, master, theme: str | None = None, crop: bool = False, **kw) -> None:
-        self._name = theme or THEME
+        self._theme = theme or THEME   # 不能叫 _name：tkinter.Misc 会把它覆盖成控件路径名
         self._crop = crop
-        t = palette(self._name)
+        t = palette(self._theme)
         super().__init__(master, bg=t.bg_base, highlightthickness=0, bd=0, **kw)
         self._job = None
         self._img = None
         self.bind("<Configure>", self._on_resize)
+        self.bind("<Destroy>", self._on_destroy, add="+")
+
+    def _on_destroy(self, _e=None) -> None:
+        if self._job is not None:
+            try:
+                self.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
 
     def _on_resize(self, e) -> None:
         if self._job is not None:
@@ -1014,12 +1043,12 @@ class OceanBackdrop(tk.Canvas):
         self._job = None
         self.delete("bg")
         if self._crop:
-            photo = ocean_slice(self, w, h, self._name)
+            photo = ocean_slice(self, w, h, self._theme)
         else:
-            img = ocean_image(w, h, self._name)
+            img = ocean_image(w, h, self._theme)
             photo = None if img is None else ImageTk.PhotoImage(img)
         if photo is None:                    # 没有 Pillow：退化成纯色
-            self.configure(bg=palette(self._name).bg_base)
+            self.configure(bg=palette(self._theme).bg_base)
             return
         self._img = photo
         self.create_image(0, 0, image=photo, anchor="nw", tags="bg")

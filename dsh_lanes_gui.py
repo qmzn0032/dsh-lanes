@@ -125,6 +125,33 @@ def enable_dpi_awareness() -> None:
             pass
 
 
+def set_dark_titlebar(root: tk.Tk, dark: bool) -> None:
+    """让 Windows 的标题栏跟着主题走（深海下不再是那条浅灰带）。
+
+    为什么非做不可：窗口内容换成深海之后，上面还压着一条 #F3F3F3 的系统标题栏，
+    整个窗口像被横着切了一刀 —— 这是"两种模式割裂感"里最扎眼的一条。
+    接口是 Win10 1809+ 的 DWMWA_USE_IMMERSIVE_DARK_MODE：1909 及以前是 19，
+    2004 之后是 20，两个都发一遍（发错的那个会被系统忽略）。
+    设完要 SWP_FRAMECHANGED 一次，否则已经画出来的标题栏不会重绘。
+    纯外观问题：失败一律吞掉，不影响任何功能。
+    """
+    if os.name != "nt":
+        return
+    try:
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id()) or root.winfo_id()
+        value = ctypes.c_int(1 if dark else 0)
+        for attr in (20, 19):
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, attr, ctypes.byref(value), ctypes.sizeof(value)
+            )
+        SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_FRAMECHANGED = 0x1, 0x2, 0x4, 0x20
+        ctypes.windll.user32.SetWindowPos(
+            hwnd, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED
+        )
+    except Exception:
+        pass
+
+
 class QueueWriter(io.TextIOBase):
     """把核心模块 print 出来的内容按行送进队列，供主线程写进日志面板。"""
 
@@ -383,7 +410,7 @@ class LauncherApp:
         self.root = root
         self.q: queue.Queue = queue.Queue()
         self.busy = False
-        self.restart = False      # 主题切换置 True：main() 见它就把窗口重建成新主题
+        self._switching = False   # 正在换主题（防止重复点）
         self.cfg = core.load_config()
         # 记住的分栏比例（0＝没存过，用 SPLIT_DEFAULT）。存在 lanes.json → ui.split
         self._ui = dict(self.cfg.get("ui") or {})
@@ -410,10 +437,9 @@ class LauncherApp:
         root.minsize(880, 560)
         self._style()
 
-        self._build_ocean_backdrop()     # 必须先建：Tk 的叠放顺序就是创建顺序
-        self._build_header()
-        self._build_body()
-        self._build_status()
+        self._build_ui()                 # 海面垫底 → 头 → 身 → 脚（见 _build_ui）
+        self._titlebar_tries = 0
+        self._apply_titlebar()           # 标题栏配色要等窗口映射后才设得上
         self._split_id = self.root.after(90, self._apply_split)  # 分栏位置要等窗口量出真实宽度
 
         self._sig: tuple | None = None
@@ -442,14 +468,9 @@ class LauncherApp:
 
         # 根目录不可写时说清楚（不是不能用，而是"记不住 + 部分命令会失败"），
         # 别让它以"某个操作突然报错"的形式冒出来。
-        root_ok, root_detail = core.lane_root_writable(self.cfg)
-        if not root_ok:
-            self.log(f"[!!] lane 根目录不可写：{root_detail}", "warn")
-            self.log(
-                "     卡片和打开/停止仍可用（状态现场探测）；但运行态记不住，"
-                "克隆 / 删除 / 升级这些要写目录的命令会失败。",
-                "warn",
-            )
+        # 探测放后台：失败时会重试 3 次、每次 sleep 150ms —— 那是 0.45 秒的同步等待，
+        # 放在建窗路径上就是"打开慢半拍"，放在换主题路径上就是"切主题卡一下"。
+        self._probe_root_async()
 
         # 受限令牌（沙箱）是最容易看错的一种失败：文件权限、icacls 全都正常，
         # 但写文件/结束进程一律被拒。直接点名，省得用户去查 D 盘权限。
@@ -470,6 +491,59 @@ class LauncherApp:
             )
 
     # ── 基础 ────────────────────────────────────────────────────────────────
+    def _build_ui(self, host=None) -> None:
+        """整窗三块：海面垫底 → 头 → 身 → 脚（Tk 的叠放顺序＝创建顺序）。
+
+        host 默认就是窗口本身；换主题时会把整窗建在一个临时 Frame 里
+        （那个 Frame 先压在海水底下，建完再翻上来，见 _rebuild_ui）。
+        """
+        self._host = host if host is not None else self.root
+        self._build_ocean_backdrop()
+        self._chrome = [
+            self._build_header(),
+            self._build_body(),
+            self._build_status(),
+        ]
+
+    def _probe_root_async(self) -> None:
+        """在后台线程里探"根目录能不能写"，结果走日志队列回来。
+
+        它是纯提示、不挡任何操作，所以没理由占着主线程 —— 而且探测失败时会重试
+        3 次 × sleep 150ms = 0.45 秒，正好卡在建窗那一帧上。
+        """
+        cfg = self.cfg
+
+        def worker() -> None:
+            try:
+                ok, detail = core.lane_root_writable(cfg)
+            except Exception as exc:  # noqa: BLE001
+                ok, detail = False, f"{type(exc).__name__}: {exc}"
+            if ok:
+                return
+            self.q.put(("line", f"[!!] lane 根目录不可写：{detail}"))
+            self.q.put((
+                "line",
+                "     卡片和打开/停止仍可用（状态现场探测）；但运行态记不住，"
+                "克隆 / 删除 / 升级这些要写目录的命令会失败。",
+            ))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_titlebar(self) -> None:
+        """标题栏跟着主题走 —— 但只能在窗口**已经映射**之后设。
+
+        窗口还没上屏时 GetParent(winfo_id()) 拿不到外框（返回 0），
+        设下去是静默失败的：Win11 的标题栏仍然是那条浅灰带（这就是"深海窗口顶着
+        一条白条"的原因）。所以这里没映射就过 60ms 再试，最多 10 次。
+        """
+        self._titlebar_job = None
+        if not self.root.winfo_ismapped():
+            if self._titlebar_tries < 10:
+                self._titlebar_tries += 1
+                self._titlebar_job = self.root.after(60, self._apply_titlebar)
+            return
+        set_dark_titlebar(self.root, ui.theme_name() == "dark")
+
     def _center(self, w: int, h: int) -> None:
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         x, y = max(0, (sw - w) // 2), max(0, (sh - h) // 3)
@@ -613,7 +687,7 @@ class LauncherApp:
         # 顶部工具栏：一块浮在海水上的白卡（上面和两边各留 GUT，露出来的就是海面）。
         # 原来是通栏白带 + 一条下边框；整窗铺海之后，通栏白带会把海拦腰截断。
         card = ui.RoundedCard(
-            self.root, bg=CARD, border=BORDER, radius=14, padx=18, pady=12,
+            self._host, bg=CARD, border=BORDER, radius=14, padx=18, pady=12,
             shadow="s2", ocean=True,
         )
         card.pack(fill="x", padx=GUT, pady=(GUT, 0))
@@ -658,6 +732,7 @@ class LauncherApp:
         self._remote_note("正在查询 npm 上的版本…", ui.SUBTLE)
         self._header_left = left
         left.bind("<Configure>", self._on_header_resize)
+        return card
 
     # ── 主体 ────────────────────────────────────────────────────────────────
     def _build_body(self) -> None:
@@ -669,7 +744,7 @@ class LauncherApp:
           · 中间：SASH_W 像素的缝，海从缝里透出来，鼠标移上去会亮成品牌蓝。
         """
         self.split = tk.PanedWindow(
-            self.root, orient="horizontal", bg=BG, bd=0, relief="flat",
+            self._host, orient="horizontal", bg=BG, bd=0, relief="flat",
             sashwidth=SASH_W, sashrelief="flat", sashcursor="sb_h_double_arrow",
             opaqueresize=True, showhandle=False,
         )
@@ -794,10 +869,11 @@ class LauncherApp:
         T.bind("<MouseWheel>", self._on_log_wheel, add="+")
         for seq in ("<ButtonRelease-1>", "<B1-Motion>", "<KeyRelease>"):
             T.bind(seq, lambda _e: self.root.after(20, self._sync_autoscroll), add="+")
+        return self.split
 
     def _build_status(self) -> None:
         # 底部状态条：也是一块浮在海水上的白卡，收住整个窗口
-        card = ui.RoundedCard(self.root, bg=CARD, border=BORDER, radius=12,
+        card = ui.RoundedCard(self._host, bg=CARD, border=BORDER, radius=12,
                               padx=16, pady=7, ocean=True)
         card.pack(fill="x", padx=GUT, pady=(8, GUT))
         bar = card.inner
@@ -807,6 +883,7 @@ class LauncherApp:
         self.busy_label.pack(side="right")
         self.counts = tk.Label(bar, text="", bg=CARD, fg=MUTED, font=(FONT_UI, 9))
         self.counts.pack(side="right", padx=14)
+        return card
 
     # ── 整窗海面 / 可拖拽分栏 ────────────────────────────────────────────────
     def _build_ocean_backdrop(self) -> None:
@@ -817,10 +894,11 @@ class LauncherApp:
         创建顺序，所以它必须**最先**建 —— 后面 build 的头部/主体/状态都压在它上面，
         没被控件盖住的地方（窗口四边、分栏缝、卡片之间）露出来的就是海面。
         """
-        self._ocean = ui.OceanBackdrop(self.root)
+        self._ocean = ui.OceanBackdrop(self._host)
         self._ocean.place(x=0, y=0, relwidth=1.0, relheight=1.0)
         # 注意：不要在这里调 self._ocean.lower() —— Canvas 上的 lower/raise 是「图形项
         # 层级」，要 tagOrId，会直接抛 wrong # args。叠放顺序＝创建顺序，先建就够低了。
+        return self._ocean
 
     def _layout_list(self, w: int | None = None, h: int | None = None) -> None:
         """左列布局：内容比视口短时把列表撑满视口（否则底下会露一条纯色），
@@ -3027,28 +3105,155 @@ class LauncherApp:
         reg_var.trace_add("write", reload_versions)
         reload_versions()
 
-    # ── 关闭 ────────────────────────────────────────────────────────────────
+    # ── 主题切换：在同一个窗口里重建 ─────────────────────────────────────────
     def toggle_theme(self) -> None:
-        """浅海 ↔ 深海：存进 lanes.json → ui.theme，然后重建窗口（见 main 的重启循环）。
+        """浅海 ↔ 深海：记住选择，然后**原地**重建一遍界面。
 
-        为什么是重建而不是就地改色：Tk 没有样式层，颜色在控件创建时就定死；
-        逐个控件 configure 一遍既容易漏，又会把状态搞乱。重建一整窗不到 1 秒。
+        为什么是重建而不是就地改色：Tk 没有样式层，颜色在控件创建时就定死了，
+        逐个 configure 既容易漏、又容易把状态搞乱 —— 这一条没变。
+        变的是重建的粒度：以前是"写配置 → 销毁窗口 → main() 的循环再开一个进程"，
+        实测一次 ~1.2 秒，而且中途那一帧会被看到（海面铺好了、卡片还没长出来）。
+        现在只重建窗口里的三块，进程 / 窗口位置 / 分栏比例 / 日志内容全都不动。
         """
+        if self._switching:
+            return
         want = "dark" if ui.theme_name() == "light" else "light"
         try:
             cfg = core.load_config()
             u = dict(cfg.get("ui") or {})
             u["theme"] = want
             w, h = self.root.winfo_width(), self.root.winfo_height()
-            if w >= 400 and h >= 300:            # 顺带记住当前窗口位置，重建后不跳
+            if w >= 400 and h >= 300:            # 顺带记住当前窗口位置，下次开窗不跳
                 u.update({"w": w, "h": h, "x": self.root.winfo_x(), "y": self.root.winfo_y()})
             cfg["ui"] = u
             core.save_config(cfg)
         except Exception:
             pass
-        self.restart = True
-        self._stop_jobs()
-        self.root.after(40, self.root.destroy)
+        self._rebuild_ui(want)
+
+    def _rebuild_ui(self, want: str) -> None:
+        """原地换主题：新版先在**海水底下**建好，最后一次性翻上来。
+
+        为什么不能直接"销毁重建"：只要中间调过一次 update_idletasks（量尺寸要用），
+        Tk 就会把当时的半成品推上屏 —— 用户看到的"切换时闪一下"就是这一帧。
+        这里的做法是双缓冲：新的一套建在一个临时 Frame 里，Frame 先 lower() 到
+        海面画布底下（尺寸、布局、绘制全都照算，但被不透明的海面盖住看不见），
+        等布局稳定了再 lift()，下一次重绘就是老界面 → 新界面，中间没有别的。
+
+        注意：**不要在这里强制重画卡片**（曾经加过一步"立刻 flush 所有卡片"，
+        想省掉 60ms 的去抖，结果在几何计算过程中调 `itemconfigure`，卡片的内嵌
+        Frame 被挪出了可视区 —— 换完主题左列整片空白）。去抖那 60ms 肉眼看不出来。
+        """
+        self._switching = True
+        try:
+            keep = self._capture_view()
+            self._stop_jobs()
+            apply_theme(want)                     # 模块级色常量 + ui_kit 里的主题
+            set_dark_titlebar(self.root, want == "dark")
+            host = tk.Frame(self.root, bg=BG, bd=0, highlightthickness=0)
+            host.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+            host.lower()                          # ← 藏到海面底下（这一刻屏幕不变）
+            self._build_ui(host)
+            self.root.update_idletasks()          # 量真实尺寸（画在海面底下，看不见）
+
+            self._split_frac = keep["split"] or SPLIT_DEFAULT
+            self._split_retry = 0
+            self._restore_view(keep)              # 日志 / 状态栏 / 远程版本行 / 分栏
+            self.refresh_lanes(force=True)        # lane 卡片全部重建
+            self.root.update_idletasks()
+            self._apply_split()
+
+            host.lift()                           # ← 一次性翻上来
+            self.root.update_idletasks()
+            for w in keep["old"]:
+                try:
+                    w.destroy()
+                except tk.TclError:
+                    pass
+            if keep["autoscroll"]:
+                self.log_text.see("end")
+            else:
+                self.log_text.yview_moveto(keep["yview"])
+            self.root.update_idletasks()
+        finally:
+            self._switching = False
+        # _stop_jobs 把定时任务全取消了，这里按建窗时一样的节奏重新挂上
+        self._poll_id = self.root.after(120, self._poll_queue)
+        self._tick_id = self.root.after(2500, self._tick)
+
+    def _capture_view(self) -> dict:
+        """换主题前记下"现场"：老控件、日志全文（连颜色）、分栏比例、状态栏文字。"""
+
+        def txt(widget) -> str:
+            try:
+                return str(widget.cget("text"))
+            except tk.TclError:
+                return ""
+
+        view = {
+            "old": list(self.root.winfo_children()),
+            "split": self._split_frac_now() or self._split_frac,
+            "status": txt(self.status),
+            "busy": txt(self.busy_label),
+            "counts": txt(self.counts),
+            "log_count": txt(self.log_count),
+            "autoscroll": bool(getattr(self, "_autoscroll", True)),
+            "back": bool(self._back_btn.winfo_manager()),
+            "yview": 0.0,
+            "remote": (self._remote_payload, self._remote_busy, self._remote_at),
+            "log": [],
+        }
+        try:
+            view["yview"] = float(self.log_text.yview()[0])
+            # dump 出来的日志带 tagon/tagoff 和原文，原样塞回去时间戳和颜色都不变
+            view["log"] = self.log_text.dump("1.0", "end-1c", text=True, tag=True)
+        except tk.TclError:
+            pass
+        return view
+
+    def _restore_view(self, view: dict) -> None:
+        self._load_log(view["log"])
+        try:
+            self.status.configure(text=view["status"])
+            self.busy_label.configure(text=view["busy"])
+            self.counts.configure(text=view["counts"])
+            self.log_count.configure(text=view["log_count"])
+        except tk.TclError:
+            pass
+        payload, busy, at = view["remote"]
+        if payload is not None:                   # 顶部「npm 上：…」那行，别退回"正在查询…"
+            self._remote_payload = payload
+            self._remote_busy = busy
+            self._remote_at = at
+            try:
+                self._render_remote()
+            except Exception:
+                pass
+        self._autoscroll = view["autoscroll"]
+        if not view["autoscroll"] and view["back"]:
+            try:
+                self._back_btn.place(relx=1.0, rely=1.0, x=-28, y=-14, anchor="se")
+            except tk.TclError:
+                pass
+
+    def _load_log(self, dump) -> None:
+        """把 Text.dump 出来的日志塞回新控件（颜色/时间戳不变，不重新打时间）。"""
+        if not dump:
+            return
+        text = self.log_text
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        active: list[str] = []
+        for kind, value, _idx in dump:
+            if kind == "tagon":
+                active.append(value)
+            elif kind == "tagoff":
+                if value in active:
+                    active.remove(value)
+            elif kind == "text":
+                text.insert("end", value, tuple(active))
+        text.configure(state="disabled")
+        self._hide_log_hint()
 
     def _save_geometry(self) -> None:
         try:
@@ -3074,7 +3279,8 @@ class LauncherApp:
         控制台上就是一串 `invalid command name "..._poll_queue"` —— 换主题时
         每次重建都会刷一遍（不是崩溃，但很难看）。
         """
-        for attr in ("_poll_id", "_tick_id", "_split_id", "_list_bg_job", "_remote_job"):
+        for attr in ("_poll_id", "_tick_id", "_split_id", "_list_bg_job", "_remote_job",
+                     "_titlebar_job"):
             job = getattr(self, attr, None)
             setattr(self, attr, None)
             if job is None:
@@ -3181,64 +3387,59 @@ def main() -> int:
 
     _safe_std_streams()
     enable_dpi_awareness()
+    apply_theme(args.theme or _saved_theme())
 
-    # 主题切换要重建整窗（Tk 没有样式层），所以主循环套一层：关窗 → 需要就再来一次。
-    while True:
-        apply_theme(args.theme or _saved_theme())
-        root = tk.Tk()
-        _set_window_icon(root)
+    # 窗口只建一次。换主题不再重启进程，而是 LauncherApp._rebuild_ui 原地重建
+    # （旧写法是 destroy 之后 while 循环再建一个 —— 一次 1.2 秒，还会露出半成品的一帧）。
+    root = tk.Tk()
+    _set_window_icon(root)
+    try:
+        root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72.0)
+    except Exception:
+        pass
+    set_dark_titlebar(root, ui.theme_name() == "dark")
+    try:
+        app = LauncherApp(root)
+    except Exception as exc:  # noqa: BLE001
+        # 绝不留一个"没有 mainloop 的半成品窗口"：那种窗口既不能正常用、也关不掉
+        # （2026-09-27 的故障就是这样：__init__ 里写运行态被拒 → 弹错误框 → 窗口挂着不动）。
+        detail = traceback.format_exc()
         try:
-            root.tk.call("tk", "scaling", root.winfo_fpixels("1i") / 72.0)
-        except Exception:
-            pass
-        try:
-            app = LauncherApp(root)
-        except Exception as exc:  # noqa: BLE001
-            # 绝不留一个"没有 mainloop 的半成品窗口"：那种窗口既不能正常用、也关不掉
-            # （2026-09-27 的故障就是这样：__init__ 里写运行态被拒 → 弹错误框 → 窗口挂着不动）。
-            detail = traceback.format_exc()
-            try:
-                messagebox.showerror(
-                    "DSH 多版本启动器 · 启动失败",
-                    f"{type(exc).__name__}: {exc}\n\n"
-                    f"{detail[-1200:]}\n"
-                    "窗口已关闭；完整信息也写到了 stderr（命令行里跑能看到）。",
-                )
-            except Exception:
-                pass
-            try:
-                root.destroy()
-            except Exception:
-                pass
-            print(detail, file=sys.stderr, flush=True)
-            return 1
-
-        if args.selfcheck:
-            root.withdraw()
-            root.update()
-            root.update_idletasks()
-            missing = [m for m in _REQUIRED_ACTIONS if not callable(getattr(app, m, None))]
-            lanes = core.load_config().get("lanes", {})
-            if missing:
-                print(f"[XX] selfcheck 失败：LauncherApp 上找不到这些方法：{'、'.join(missing)}")
-                root.destroy()
-                return 1
-            print(
-                f"selfcheck OK：窗口构建成功，{len(_REQUIRED_ACTIONS)} 个界面入口齐全，"
-                f"lane 数量 {len(lanes)}：{', '.join(lanes) or '(无)'}"
-                f"，主题 {ui.theme_name()}"
+            messagebox.showerror(
+                "DSH 多版本启动器 · 启动失败",
+                f"{type(exc).__name__}: {exc}\n\n"
+                f"{detail[-1200:]}\n"
+                "窗口已关闭；完整信息也写到了 stderr（命令行里跑能看到）。",
             )
-            root.destroy()
-            return 0
-
-        root.mainloop()
-        again = bool(getattr(app, "restart", False))
+        except Exception:
+            pass
         try:
             root.destroy()
         except Exception:
             pass
-        if not again:
-            return 0
+        print(detail, file=sys.stderr, flush=True)
+        return 1
+
+    if args.selfcheck:
+        root.withdraw()
+        root.update()
+        root.update_idletasks()
+        missing = [m for m in _REQUIRED_ACTIONS if not callable(getattr(app, m, None))]
+        lanes = core.load_config().get("lanes", {})
+        if missing:
+            print(f"[XX] selfcheck 失败：LauncherApp 上找不到这些方法：{'、'.join(missing)}")
+            root.destroy()
+            return 1
+        print(
+            f"selfcheck OK：窗口构建成功，{len(_REQUIRED_ACTIONS)} 个界面入口齐全，"
+            f"lane 数量 {len(lanes)}：{', '.join(lanes) or '(无)'}"
+            f"，主题 {ui.theme_name()}"
+        )
+        root.destroy()
+        return 0
+
+    root.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
