@@ -419,58 +419,105 @@ def port_in_use(port: int, host: str = "127.0.0.1") -> bool:
     return False
 
 
-def pid_alive(pid: int) -> bool:
+_STILL_ACTIVE = 259
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_QUERY_LIMITED = 0x1000
+
+
+def _k32():
+    """带完整原型的 kernel32：句柄是 64 位的，不设 restype 会被截成 int。"""
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    P = ctypes.c_void_p
+    k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    k.OpenProcess.restype = P
+    k.CloseHandle.argtypes = [P]
+    k.GetExitCodeProcess.argtypes = [P, ctypes.POINTER(ctypes.c_uint32)]
+    k.GetExitCodeProcess.restype = ctypes.c_int
+    k.TerminateProcess.argtypes = [P, ctypes.c_uint32]
+    k.TerminateProcess.restype = ctypes.c_int
+    return k
+
+
+def pid_state(pid: int) -> str:
+    """三态：`alive` / `dead` / `unknown`。
+
+    为什么不能只回 bool：`pid_alive()` 把"打不开"也当成"已经退出"，于是**权限不足时
+    会误报"已停止"**。2026-10-27 停 `global` 那次就是这种真假混杂的场面：
+    `pid_alive` 说还活着、taskkill 说"没有找到进程 16396"、而目标的完整性是 Medium。
+    把"查不到"单独拿出来，才不会把"不知道"说成"没在跑"。
+    """
     if pid <= 0:
-        return False
+        return "dead"
     if os.name != "nt":
         try:
             os.kill(pid, 0)
-            return True
+            return "alive"
         except OSError:
-            return False
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    STILL_ACTIVE = 259
-    k = ctypes.windll.kernel32
-    handle = k.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-    if not handle:
-        return False
+            return "dead"
+    k = _k32()
+    h = k.OpenProcess(_PROCESS_QUERY_LIMITED, False, pid)
+    if not h:
+        err = ctypes.get_last_error()
+        # 87 = ERROR_INVALID_PARAMETER：这个 pid 确实不存在
+        return "dead" if err == 87 else "unknown"
     try:
-        code = ctypes.c_uint32()
-        if not k.GetExitCodeProcess(handle, ctypes.byref(code)):
-            return False
-        return code.value == STILL_ACTIVE
+        code = ctypes.c_uint32(0)
+        if not k.GetExitCodeProcess(h, ctypes.byref(code)):
+            return "unknown"
+        return "alive" if code.value == _STILL_ACTIVE else "dead"
     finally:
-        k.CloseHandle(handle)
+        k.CloseHandle(h)
+
+
+def pid_alive(pid: int) -> bool:
+    return pid_state(pid) == "alive"
 
 
 def kill_tree(pid: int) -> str:
-    """结束整棵进程树；**返回 taskkill 的原始回话**（成功时为空串）。
+    """结束整棵进程树；返回**系统原话**（成功时为空串）。
 
-    以前把 capture_output 拿到的输出直接扔了，于是"结束不掉"只能靠猜 ——
-    而 taskkill 自己的话就是最硬的证据：
-    `错误: 无法终止 PID 16396 的进程。原因: 拒绝访问。`
+    ① 先自己拿 PROCESS_TERMINATE 试一次 —— 它的错误码是真的：
+       `5` 拒绝访问、`87` 没这个进程。taskkill 在降权进程里会回
+       "错误: 没有找到进程 16396"，而目标明明还活着（`pid_state` = alive）。
+       那句话把 2026-10-27 的排查带偏了一整轮，所以不再让它一个人说了算。
+    ② 能拿到结束权限才交给 `taskkill /T /F` 收子树（TerminateProcess 只管主进程，
+       `cmd → node` 这种父子结构单杀父进程会留下孤儿 node）。
     """
-    if os.name == "nt":
-        r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                           capture_output=True, creationflags=_no_window())
-        raw = (r.stderr or b"") + (r.stdout or b"")
-        for enc in ("oem", "utf-8", "mbcs"):
-            try:
-                text = raw.decode(enc, "replace")
-                break
-            except (LookupError, UnicodeError):
-                continue
-        else:                                  # pragma: no cover
-            text = ""
-        text = " ".join(text.split())
-        if r.returncode == 0:
-            return ""
-        return text or f"taskkill 退出码 {r.returncode}"
+    if os.name != "nt":
+        try:
+            os.kill(pid, 15)
+        except OSError as exc:
+            return str(exc)
+        return ""
+    k = _k32()
+    h = k.OpenProcess(_PROCESS_TERMINATE, False, pid)
+    if not h:
+        err = ctypes.get_last_error()
+        if err == 87:
+            return "进程已经不存在（刚刚自己退了）"
+        if err == 5:
+            return "Win32 错误 5（拒绝访问）：我这个令牌没有结束它的权限"
+        return f"打不开进程（Win32 错误 {err}）"
     try:
-        os.kill(pid, 15)
-    except OSError as exc:
-        return str(exc)
-    return ""
+        mine = bool(k.TerminateProcess(h, 1))
+        err = 0 if mine else ctypes.get_last_error()
+    finally:
+        k.CloseHandle(h)
+
+    r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True, creationflags=_no_window())
+    raw = (r.stderr or b"") + (r.stdout or b"")
+    text = ""
+    for enc in ("oem", "utf-8", "mbcs"):
+        try:
+            text = " ".join(raw.decode(enc, "replace").split())
+            break
+        except (LookupError, UnicodeError):
+            continue
+    if mine:
+        return "" if r.returncode == 0 else f"主进程已结束，收子树时 taskkill 回：{text}"
+    return (f"TerminateProcess 失败（Win32 错误 {err}）；"
+            f"taskkill 回话：{text or f'退出码 {r.returncode}'}")
 
 
 def process_integrity(pid: int) -> str:
@@ -794,8 +841,8 @@ def token_state() -> dict:
     return out
 
 
-def proc_parent_chain(depth: int = 3, pid: int | None = None) -> str:
-    """本进程的父进程链，形如 `pythonw ← DSH多版本启动器-轻量 ← explorer`。
+def proc_ancestry(depth: int = 3, pid: int | None = None) -> list[tuple[str, int]]:
+    """本进程的祖先链，`[(名字, pid), …]`，从自己开始往上。
 
     传 `pid` 时改成从那个进程往上走（诊断别人的窗口用），默认就是自己。
 
@@ -856,22 +903,22 @@ def proc_parent_chain(depth: int = 3, pid: int | None = None) -> str:
                 return "?"
             return Path(b.value).stem or "?"
 
-        names: list[str] = []
+        rows: list[tuple[str, int]] = []
         pid = 0
         if start_pid:
             h = _open(int(start_pid))
             if not h:
-                return "?"
+                return []
             try:
                 _me, pid = _pbi(h)
-                names.append(_stem(h))
+                rows.append((_stem(h), int(start_pid)))
             finally:
                 k32.CloseHandle(h)
         else:
             h = k32.GetCurrentProcess()
             try:
                 me, parent = _pbi(h)
-                names.append(_stem(h))                   # 自己
+                rows.append((_stem(h), int(me)))         # 自己
                 pid = parent
             finally:
                 k32.CloseHandle(h)
@@ -880,19 +927,27 @@ def proc_parent_chain(depth: int = 3, pid: int | None = None) -> str:
                 break
             ph = _open(pid)
             if not ph:
-                # 连 pid 一起留下：父进程也可能已经退出（启动器那个 exe 壳子就是
-                # 「拉起来就退」），或者被我的受限令牌挡住了 —— 两种都值得知道。
-                names.append(f"?({pid})")
+                # 名字拿不到也把 pid 留下：父进程可能已经退出（启动器那个 exe 壳子
+                # 就是「拉起来就退」），也可能被我的受限令牌挡住了。
+                rows.append(("?", int(pid)))
                 break
             try:
-                names.append(_stem(ph))
-                _me, nxt = _pbi(ph)
+                _pid, nxt = _pbi(ph)
+                rows.append((_stem(ph), int(_pid or pid)))
                 pid = nxt
             finally:
                 k32.CloseHandle(ph)
-        return " ← ".join(names)
+        return rows
     except Exception:
-        return ""
+        return []
+
+
+def proc_parent_chain(depth: int = 3, pid: int | None = None) -> str:
+    """祖先链的字符串版：`pythonw ← pyw ← ?(7944)`。"""
+    out = []
+    for name, p in proc_ancestry(depth, pid):
+        out.append(f"?({p})" if name == "?" else name)
+    return " ← ".join(out)
 
 
 def _fallback_log_path(log: Path) -> Path:
@@ -2378,22 +2433,28 @@ def cmd_stop(cfg: dict, args) -> int:
         if pid and pid_alive(pid):
             started = process_start_time(pid)
             info(f"正在停止 lane「{lane}」(pid {pid}{'，启动于 ' + started if started else ''}) …")
+            mine = token_state()
+            lvl = str(mine.get("integrity") or "?")
+            crippled = bool(mine.get("restricted")) or lvl in ("Low", "Untrusted")
             said = kill_tree(pid)
             time.sleep(0.6)
-            if pid_alive(pid):
+            st = pid_state(pid)                      # alive / dead / unknown 三态
+            if st != "dead":
                 warn(f"lane「{lane}」进程 {pid} 仍存活 —— 结束不掉它")
                 if said:
-                    warn(f"     taskkill 原话：{said}")
-                mine = token_state()
-                lvl = str(mine.get("integrity") or "?")
+                    warn(f"     系统原话：{said}")
                 theirs = process_integrity(pid)
                 warn(
                     f"     实测：我 = 完整性 {lvl}"
                     f"{' + 受限令牌' if mine.get('restricted') else ''}"
                     f"；它 = 完整性 {theirs or '查不到（连打开进程都被拒）'}")
-                if mine.get("restricted") or lvl in ("Low", "Untrusted"):
-                    warn("     → 是「我这一侧」被降权了：降权窗口结束不掉任何正常进程。"
-                         "关掉启动器，用资源管理器双击 DSH多版本启动器-轻量.exe 重开再停。")
+                if st == "unknown":
+                    warn("     （它现在是「查不到」而不是「已退出」——别当成停成功了）")
+                if crippled:
+                    warn("     → 是「我这一侧」被降权了：降权窗口结束不掉任何正常进程，"
+                         "taskkill 在这种令牌里还会误报「没有找到进程」。")
+                    warn("     解法：关掉启动器，用「资源管理器」双击 DSH多版本启动器-轻量.exe "
+                         "重开再停；急用就右键 exe → 以管理员身份运行（等于绕开降权）。")
                 elif theirs in ("High", "System"):
                     warn(f"     → 是「它比我高」（它跑在 {theirs}）：它当初是用管理员身份启动的。"
                          "要么用管理员身份打开启动器再停，要么就在那个窗口里自己关。")
