@@ -86,7 +86,7 @@ apply_theme(_saved_theme())
 # ── 版本号：窗口标题和状态条都会打出它 ──────────────────────────────────────
 # 加这个的原因很实在：你会怀疑"我开的和你的不是同一版"，而界面上原来没有任何
 # 版本标识 —— 只能靠背景色猜。以后打开先看右下角/标题栏这几个字，一眼对上。
-APP_VERSION = "v0.3.9"
+APP_VERSION = "v0.3.10"
 
 FONT_UI = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
@@ -544,29 +544,35 @@ class LauncherApp:
         self.log("快捷键：F5 刷新　Ctrl+L 清空日志　Ctrl+N 新建版本　双击卡片＝打开　点地址＝复制", "muted")
         self.log("标题下面那行的「√」＝本机已经装了这个版本；点「官方代码库 ↗」直接去 dsh 的仓库。", "muted")
 
+        # 降权（Low 完整性 / 受限令牌）是最容易看错的一种失败：文件权限、icacls
+        # 全都正常，可写文件、结束进程一律被拒，用户第一反应永远是"去改 D 盘权限"。
+        # 2026-10-27 那次就是：窗口跑在 **Low 完整性 + 非受限令牌** 上，而 v0.3.9
+        # 只判了 restricted → 这条提醒整段没出现，只剩「根目录不可写」和
+        # 「结束不掉它，常见原因①受限沙箱②它是管理员启动的」两句越看越糊涂的话。
+        # 所以这里把**实测到的东西**摊开：完整性级别 + 父进程链。
+        tok = core.token_state()
+        level = str(tok.get("integrity") or "?")
+        self._crippled = bool(tok.get("restricted")) or level in ("Low", "Untrusted")
+        if self._crippled:
+            self.log(
+                f"[!!] 这个窗口被降权了（完整性={level}"
+                f"{'，令牌受限' if tok.get('restricted') else ''}）"
+                "——不是 D 盘权限问题，别去改目录权限", "warn")
+            chain = core.proc_parent_chain()
+            if chain:
+                self.log(f"     是谁把它拉起来的：{chain}", "warn")
+            self.log(
+                "     表现：写不了 lane 根目录、停不掉 lane 进程、打开 lane 也可能起不来。",
+                "warn")
+            self.log(
+                "     解法：关掉这个窗口，用「资源管理器」双击 DSH多版本启动器-轻量.exe；"
+                "从 DSH 终端 / 插件 / agent 里起的窗口，令牌一定是降权的。", "warn")
+
         # 根目录不可写时说清楚（不是不能用，而是"记不住 + 部分命令会失败"），
         # 别让它以"某个操作突然报错"的形式冒出来。
         # 探测放后台：失败时会重试 3 次、每次 sleep 150ms —— 那是 0.45 秒的同步等待，
         # 放在建窗路径上就是"打开慢半拍"，放在换主题路径上就是"切主题卡一下"。
         self._probe_root_async()
-
-        # 受限令牌（沙箱）是最容易看错的一种失败：文件权限、icacls 全都正常，
-        # 但写文件/结束进程一律被拒。直接点名，省得用户去查 D 盘权限。
-        tok = core.token_state()
-        if tok.get("restricted"):
-            self.log("[!!] 这个窗口被关在受限沙箱里（restricted token）——不是 D 盘权限问题", "warn")
-            self.log(
-                "     表现：写不了 D:\\dsh-lanes、停不掉别的进程、打开 lane 也起不来。",
-                "warn",
-            )
-            self.log(
-                "     原因：它是从 DSH 的终端 / 工具 / 沙箱里拉起来的，令牌被裁剪过。",
-                "warn",
-            )
-            self.log(
-                "     解法：关掉这个窗口，去资源管理器双击 exe（或桌面快捷方式）。",
-                "warn",
-            )
 
     # ── 基础 ────────────────────────────────────────────────────────────────
     def _build_ui(self, host=None) -> None:
@@ -590,6 +596,7 @@ class LauncherApp:
         3 次 × sleep 150ms = 0.45 秒，正好卡在建窗那一帧上。
         """
         cfg = self.cfg
+        crippled = self._crippled        # 在起线程前定好，避免线程里读到的时序不确定
 
         def worker() -> None:
             try:
@@ -597,6 +604,10 @@ class LauncherApp:
             except Exception as exc:  # noqa: BLE001
                 ok, detail = False, f"{type(exc).__name__}: {exc}"
             if ok:
+                return
+            if crippled:
+                # 已经在上面的降权提醒里解释过原因了，这里只报事实，别再给一遍误会的线索
+                self.q.put(("line", "[!!] lane 根目录写不进去 —— 就是上面那个「降权」，不是 D 盘权限"))
                 return
             self.q.put(("line", f"[!!] lane 根目录不可写：{detail}"))
             self.q.put((

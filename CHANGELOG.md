@@ -6,6 +6,52 @@ exe 不进仓库（`.gitignore` 排除了 `dist/`、`_build/` 和 `*.exe`），�
 
 ---
 
+## v0.3.10 — 2026-10-27
+
+### 「不加管理员就没法操作」：真正的元凶是完整性表错了一格
+
+用户反馈：不开管理员权限，写不了目录、停不掉 lane。窗口日志只有两句更像"权限配置坏了"的话：
+
+```
+[!!] lane 根目录不可写：D:\dsh-lanes（PermissionError: [Errno 13] Permission denied: 'D:\\dsh-lanes\\.write-test-12376-2'）
+[!!] lane「global」进程 16396 仍存活 —— 结束不掉它
+     常见原因：① 我在受限沙箱里（令牌被裁剪）② 它是用管理员权限启动的
+```
+
+三件事分开查了一遍：
+
+| 判据 | 实测 | 说明 |
+| --- | --- | --- |
+| `D:\dsh-lanes` 的 DACL | `Authenticated Users: Modify` | 权限设置是好的，**不是 D 盘的事** |
+| 那个窗口（pid 12376）的真实完整性 | **Low** | 用 `whoami /groups` 与 `OpenProcess+GetTokenInformation` 两条独立路径交叉确认 |
+| 它的令牌 | 非受限令牌 | 所以 v0.3.9 那个 `if tok["restricted"]` 的提醒**不会触发** |
+
+根因在 `token_state()` 里一张查表：
+
+```python
+# 错（v0.3.10 之前）：0x0800 当 Low、0x1000 当 Medium、0x2000 当 High
+{0x0000: "Untrusted", 0x0800: "Low", 0x1000: "Medium", 0x2000: "High", 0x3000: "System"}
+```
+
+完整性 SID 的最后一节就是"倍数 × 0x1000"：`S-1-16-4096`=Low、`8192`=Medium、`12288`=High、`16384`=System。
+于是**每个进程都被读高一级**：真 Low 的降权窗口报成 Medium、真 Medium 报成 High。后果是降权检测
+永远不触发，用户只看到"不可写 / 停不掉"这些指向权限设置的症状，去改目录权限当然改不好。
+
+### 改法
+
+- **完整性表改对**（`0x1000`=Low、`0x2000`=Medium、`0x3000`=High、`0x4000`=System），并在代码里写清这次踩的坑。
+- **降权判定按实测值**：`restricted or integrity in (Low, Untrusted)`。命中时横幅直接打
+  `完整性=Low`、**父进程链**（`pythonw ← pyw ← ?(1234)`）、表现和解法，不再让用户自己猜。
+- **`kill_tree()` 返回 taskkill 的原话**（以前 `capture_output` 拿到就扔），结束失败时打
+  `taskkill 原话：错误: 无法终止 PID … 原因: 拒绝访问。`
+- 新增 **`process_integrity(pid)`**：读取目标进程的完整性级别，好在"结束不掉"时区分
+  **「我这一侧被降权」**（解法：换个地方启动）和 **「它比我高」**（解法：它当初是管理员启动的）——
+  这两件事的解法完全相反，以前只能罗列猜测。
+- 新增 **`proc_parent_chain(depth, pid)`**：只读地往上走父进程链，回答"是谁把它拉起来的"。
+- 降权时，「lane 根目录不可写」不再重复解释一遍原因，只留一行指回上面那条提醒。
+
+---
+
 ## v0.3.9 — 2026-10-26
 
 ### 「拖动和滑轮还是一闪一闪」：先量清楚，再动刀

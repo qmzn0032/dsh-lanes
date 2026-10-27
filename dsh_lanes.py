@@ -443,15 +443,81 @@ def pid_alive(pid: int) -> bool:
         k.CloseHandle(handle)
 
 
-def kill_tree(pid: int) -> None:
+def kill_tree(pid: int) -> str:
+    """结束整棵进程树；**返回 taskkill 的原始回话**（成功时为空串）。
+
+    以前把 capture_output 拿到的输出直接扔了，于是"结束不掉"只能靠猜 ——
+    而 taskkill 自己的话就是最硬的证据：
+    `错误: 无法终止 PID 16396 的进程。原因: 拒绝访问。`
+    """
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True, creationflags=_no_window())
-    else:
+        r = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, creationflags=_no_window())
+        raw = (r.stderr or b"") + (r.stdout or b"")
+        for enc in ("oem", "utf-8", "mbcs"):
+            try:
+                text = raw.decode(enc, "replace")
+                break
+            except (LookupError, UnicodeError):
+                continue
+        else:                                  # pragma: no cover
+            text = ""
+        text = " ".join(text.split())
+        if r.returncode == 0:
+            return ""
+        return text or f"taskkill 退出码 {r.returncode}"
+    try:
+        os.kill(pid, 15)
+    except OSError as exc:
+        return str(exc)
+    return ""
+
+
+def process_integrity(pid: int) -> str:
+    """另一个进程的完整性级别（Low / Medium / High / …）；打不开就返回空串。
+
+    用来回答"结束不掉，是因为它比我高，还是因为我被降权了" ——
+    这两件事的解法完全相反（前者要提权，后者要换个地方启动）。
+    """
+    if os.name != "nt" or pid <= 0:
+        return ""
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ad = ctypes.WinDLL("advapi32", use_last_error=True)
+    P = ctypes.c_void_p
+    k32.CloseHandle.argtypes = [P]
+    ad.OpenProcessToken.argtypes = [P, ctypes.c_uint32, ctypes.POINTER(P)]
+    ad.OpenProcessToken.restype = ctypes.c_int
+    ad.GetTokenInformation.argtypes = [P, ctypes.c_int, P, ctypes.c_uint32,
+                                       ctypes.POINTER(ctypes.c_uint32)]
+    ad.GetTokenInformation.restype = ctypes.c_int
+    ad.GetSidSubAuthorityCount.argtypes = [P]
+    ad.GetSidSubAuthorityCount.restype = P
+    ad.GetSidSubAuthority.argtypes = [P, ctypes.c_uint32]
+    ad.GetSidSubAuthority.restype = P
+    handle = k32.OpenProcess(0x1000, False, pid)      # QUERY_LIMITED
+    if not handle:
+        return ""
+    try:
+        h = P()
+        if not ad.OpenProcessToken(handle, 0x0008, ctypes.byref(h)):   # TOKEN_QUERY
+            return ""
         try:
-            os.kill(pid, 15)
-        except OSError:
-            pass
+            need = ctypes.c_uint32(0)
+            ad.GetTokenInformation(h, 25, None, 0, ctypes.byref(need))
+            buf = ctypes.create_string_buffer(max(int(need.value), 64))
+            if not ad.GetTokenInformation(h, 25, buf, need, ctypes.byref(need)):
+                return ""
+            sid = ctypes.cast(buf, ctypes.POINTER(P))[0]
+            count = ctypes.cast(ad.GetSidSubAuthorityCount(sid),
+                                ctypes.POINTER(ctypes.c_ubyte))[0]
+            rid = ctypes.cast(ad.GetSidSubAuthority(sid, max(int(count) - 1, 0)),
+                              ctypes.POINTER(ctypes.c_uint32))[0]
+            return {0x0000: "Untrusted", 0x1000: "Low", 0x2000: "Medium",
+                    0x3000: "High", 0x4000: "System"}.get(rid, hex(rid))
+        finally:
+            k32.CloseHandle(h)
+    finally:
+        k32.CloseHandle(handle)
 
 
 # ======================= 实例发现（纯 ctypes，不依赖 netstat / WMI） =======================
@@ -710,15 +776,123 @@ def token_state() -> dict:
                 count = ctypes.cast(pc, ctypes.POINTER(ctypes.c_ubyte))[0]
                 pr = ad.GetSidSubAuthority(sid, max(int(count) - 1, 0))
                 rid = ctypes.cast(pr, ctypes.POINTER(ctypes.c_uint32))[0]
+                # 完整性 SID 的最后一节是"多少倍 0x1000"：S-1-16-4096=Low、
+                # S-1-16-8192=Medium、S-1-16-12288=High、S-1-16-16384=System。
+                # 这张表 2026-10-27 之前整体错了一格（0x1000 写成 Medium、
+                # 0x0800 写成 Low），于是**每个进程都被读高一级**：
+                # 真 Low 的沙箱窗口报成 Medium、真 Medium 报成 High。
+                # 直接后果就是"降权检测永远不触发"，用户只能看到
+                # 「根目录不可写」「结束不掉它」这些更像权限配置问题的症状。
                 out["integrity"] = {
-                    0x0000: "Untrusted", 0x0800: "Low", 0x1000: "Medium",
-                    0x2000: "High", 0x3000: "System",
+                    0x0000: "Untrusted", 0x1000: "Low", 0x2000: "Medium",
+                    0x3000: "High", 0x4000: "System",
                 }.get(rid, hex(rid))
         finally:
             k32.CloseHandle(h)
     except Exception:
         pass
     return out
+
+
+def proc_parent_chain(depth: int = 3, pid: int | None = None) -> str:
+    """本进程的父进程链，形如 `pythonw ← DSH多版本启动器-轻量 ← explorer`。
+
+    传 `pid` 时改成从那个进程往上走（诊断别人的窗口用），默认就是自己。
+
+    为什么需要它：令牌被降权（完整性 Low／受限令牌）时，只看自己永远看不出
+    「是谁把我拉起来的」。2026-10-27 那次就是这个局面 —— 窗口日志说
+    `D:\\dsh-lanes 不可写`，D 盘 ACL 却是「Authenticated Users: 修改」全都正常，
+    因为真正的原因是进程跑在 Low 完整性上，而它之所以 Low，是父进程带来的。
+    父进程链把这条线索直接摊开：`explorer` 起的是 Medium，`pwsh/node` 起的
+    才是沙箱降权版。
+
+    只读、不终止任何进程；拿不到的层用 `?` 占位，宁缺不猜。
+    """
+    if os.name != "nt":
+        return ""
+    start_pid = pid
+    raise_ = 0x1000          # PROCESS_QUERY_LIMITED_INFORMATION
+    query = 0x0400           # PROCESS_QUERY_INFORMATION
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ntd = ctypes.WinDLL("ntdll")
+        P = ctypes.c_void_p
+        k32.GetCurrentProcess.restype = P
+        k32.GetCurrentProcess.argtypes = []
+        k32.CloseHandle.argtypes = [P]
+        k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        k32.OpenProcess.restype = P
+        k32.QueryFullProcessImageNameW.argtypes = [P, ctypes.c_uint32,
+                                                   ctypes.c_wchar_p,
+                                                   ctypes.POINTER(ctypes.c_uint32)]
+        k32.QueryFullProcessImageNameW.restype = ctypes.c_int
+        ntd.NtQueryInformationProcess.argtypes = [P, ctypes.c_int, P, ctypes.c_uint32,
+                                                 ctypes.POINTER(ctypes.c_uint32)]
+        ntd.NtQueryInformationProcess.restype = ctypes.c_long
+
+        def _pbi(handle) -> tuple[int, int]:
+            """→ (pid, 父 pid)；失败返回 (0, 0)。"""
+            buf = ctypes.create_string_buffer(48)
+            got = ctypes.c_uint32(0)
+            if ntd.NtQueryInformationProcess(handle, 0, buf, 48,
+                                             ctypes.byref(got)) != 0:
+                return 0, 0
+            raw = buf.raw
+            me = int.from_bytes(raw[32:40], "little")
+            parent = int.from_bytes(raw[40:48], "little")
+            return me, parent
+
+        def _open(pid: int):
+            for access in (query, raise_):
+                h = k32.OpenProcess(access, 0, pid)
+                if h:
+                    return h
+            return None
+
+        def _stem(h) -> str:
+            b = ctypes.create_unicode_buffer(600)
+            n = ctypes.c_uint32(600)
+            if not k32.QueryFullProcessImageNameW(h, 0, b, ctypes.byref(n)):
+                return "?"
+            return Path(b.value).stem or "?"
+
+        names: list[str] = []
+        pid = 0
+        if start_pid:
+            h = _open(int(start_pid))
+            if not h:
+                return "?"
+            try:
+                _me, pid = _pbi(h)
+                names.append(_stem(h))
+            finally:
+                k32.CloseHandle(h)
+        else:
+            h = k32.GetCurrentProcess()
+            try:
+                me, parent = _pbi(h)
+                names.append(_stem(h))                   # 自己
+                pid = parent
+            finally:
+                k32.CloseHandle(h)
+        for _ in range(max(0, depth)):
+            if not pid:
+                break
+            ph = _open(pid)
+            if not ph:
+                # 连 pid 一起留下：父进程也可能已经退出（启动器那个 exe 壳子就是
+                # 「拉起来就退」），或者被我的受限令牌挡住了 —— 两种都值得知道。
+                names.append(f"?({pid})")
+                break
+            try:
+                names.append(_stem(ph))
+                _me, nxt = _pbi(ph)
+                pid = nxt
+            finally:
+                k32.CloseHandle(ph)
+        return " ← ".join(names)
+    except Exception:
+        return ""
 
 
 def _fallback_log_path(log: Path) -> Path:
@@ -2204,11 +2378,28 @@ def cmd_stop(cfg: dict, args) -> int:
         if pid and pid_alive(pid):
             started = process_start_time(pid)
             info(f"正在停止 lane「{lane}」(pid {pid}{'，启动于 ' + started if started else ''}) …")
-            kill_tree(pid)
+            said = kill_tree(pid)
             time.sleep(0.6)
             if pid_alive(pid):
                 warn(f"lane「{lane}」进程 {pid} 仍存活 —— 结束不掉它")
-                warn("     常见原因：① 我在受限沙箱里（令牌被裁剪）② 它是用管理员权限启动的")
+                if said:
+                    warn(f"     taskkill 原话：{said}")
+                mine = token_state()
+                lvl = str(mine.get("integrity") or "?")
+                theirs = process_integrity(pid)
+                warn(
+                    f"     实测：我 = 完整性 {lvl}"
+                    f"{' + 受限令牌' if mine.get('restricted') else ''}"
+                    f"；它 = 完整性 {theirs or '查不到（连打开进程都被拒）'}")
+                if mine.get("restricted") or lvl in ("Low", "Untrusted"):
+                    warn("     → 是「我这一侧」被降权了：降权窗口结束不掉任何正常进程。"
+                         "关掉启动器，用资源管理器双击 DSH多版本启动器-轻量.exe 重开再停。")
+                elif theirs in ("High", "System"):
+                    warn(f"     → 是「它比我高」（它跑在 {theirs}）：它当初是用管理员身份启动的。"
+                         "要么用管理员身份打开启动器再停，要么就在那个窗口里自己关。")
+                else:
+                    warn("     → 两边权限相同却停不掉：可能被别的进程当子进程攥着，"
+                         "或安全软件拦了 taskkill。先试任务管理器手动结束。")
                 warn(f"     手动结束：任务管理器 → 详细信息 → 找 PID {pid} → 结束任务")
             else:
                 ok(f"lane「{lane}」已停止")
