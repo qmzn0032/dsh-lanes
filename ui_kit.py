@@ -838,11 +838,15 @@ def _chip_style(t, kind: str) -> dict:
         "key":     {"bg": t.inset,      "fg": t.label2,     "line": t.line1,     "mono": False},
         "ok":      {"bg": t.success_bg, "fg": t.success_fg, "line": t.success_line, "mono": True},
         "warn":    {"bg": t.warn_bg,    "fg": t.warn_fg,    "line": t.warn_line, "mono": False},
+        "error":   {"bg": t.error_bg,   "fg": t.error_fg,   "line": t.error_line, "mono": False},
     }.get(kind, {"bg": t.inset, "fg": t.label2, "line": t.line1, "mono": True})
 
 
 class Chip(tk.Canvas):
-    """标签芯片：版本号 kind="ver"（等宽），"★ 主要版本" kind="primary"。"""
+    """标签芯片：版本号 kind="ver"（等宽），"★ 主要版本" kind="primary"。
+
+    kind：ver / primary / soft / key / ok / warn / error（error 用于"这会出事"的红记号）。
+    """
 
     H = 22
 

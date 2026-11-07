@@ -6,6 +6,73 @@ exe 不进仓库（`.gitignore` 排除了 `dist/`、`_build/` 和 `*.exe`），�
 
 ---
 
+## v0.3.12 — 2026-11-07
+
+### 开门前先看一眼：会话格式守卫
+
+DSH 的会话文件是**按格式代数**分文件存的：0 代叫 `session.jsonl.zstd`，之后每一代叫
+`session.vN.jsonl.zstd`（文件名规则在 `@deepseek-ai/dsh-session-format` 里）。换版本时踩的是
+两种相反的事：
+
+- 开一版**读得懂**旧文件的 DSH：旧代文件被**就地迁移**成新代——老文件还在，但旧版本从此读不了；
+- 开一版**读不懂**新文件的 DSH：`resolveCurrentLog()` 直接抛
+  `log was written by a newer harness — upgrade the harness to open it`。
+
+v0.3.12 给每条 lane 加了一道只读体检，判据全部从**本机安装树**里读，不查写死的版本表：
+
+| 读什么 | 从哪个包里读 |
+| --- | --- |
+| 这一版读第几代 | `@deepseek-ai/dsh-session` 的 `const SESSION_FORMAT_VERSION` |
+| 文件名怎么算 | `@deepseek-ai/dsh-session-format`：`sessionFormatLogFilename()` / `parseSessionFormatLogFilename()` |
+| 能升到第几代 | 已装的 `@deepseek-ai/dsh-session-format-vN-to-vM` 就是升级边；缺哪段就升不上去 |
+| 真出事长什么样 | `@deepseek-ai/dsh-session-persistence-jsonl` 的 `resolveCurrentLog()` |
+
+界面上的表现：
+
+- 卡片标题旁多一枚芯片：`会话 v3→v4`（琥珀 = 只有旧会话会受影响）、`! 会话 v4 太新`（红 = 打不开）、
+  `! 缺升级包 vN`（红）；
+- 点「打开」（或双击卡片）先弹确认框：写清"这一版读第几代 / HOME 里实际有哪几代 / 会发生什么"，
+  默认勾上**先备份对话再打开**（快照存 `<root>\backups\chat\<lane>`，可随时恢复）；
+- 琥珀那种可以**「以后别再问」**：记住的是 `v{本版代数}:v{HOME 最高代数}` 这一对——
+  换版本、或 HOME 里出现新一代，提醒自动回来；
+- 红的那种（会话比本版新 / 缺升级包）每次都拦。
+
+### 为什么琥珀色那种不硬拦
+
+日常用的那条 lane（本机 `global`，`C:\Users\Administrator\.dsh`）里永远躺着旧代会话：
+实测 207 个会话 = v0×84 / v3×52 / v4×98，按"只有旧会话"算 136 个。每次都硬拦，人只会学会
+闭着眼点「仍然打开」——那就等于没有守卫。所以 `warn` 提醒一次（可记住），
+`danger`（真打不开 / 真会报错）才每次都拦。
+
+### 实测（本机，只读，不动任何 lane）
+
+| lane | 判出来 | 档位与结论 |
+| --- | --- | --- |
+| `global`（0.2.1-rc.4，读 v4） | v0×84 / v3×52 / v4×98 | `warn`：136 个旧会话打开时会被就地升到 v4 |
+| `MZYS` | 全是 v4 | `ok` |
+| `isp` / `stable` / `next` | HOME 里还没有会话文件 | `empty`（换版本随便换） |
+| 降级预演：`global` → 0.1.5-rc.3（读 v3） | 98 个 v4 会话 | `danger`：本版打不开这些会话 |
+
+### 验证
+
+```powershell
+py _tests\t_gui_guard.py                  # 39 条断言（6 种放行/拦截路径 + 真实 lanes.json 只读）
+py _ui-preview\shot_guard.py dark         # 真窗口截图：卡片芯片 + 确认框（只点"取消"）
+py dsh_lanes_gui.py --selfcheck           # 29 个入口
+```
+
+`_tests\t_gui_guard.py` 里 `fmt_gate` 那几组把 `load_config` / `save_config` 换成了内存记账，
+所以连"记住这一次"也不会写到真的 `lanes.json`；截图脚本也不发任何真命令。
+
+### 顺手
+
+- `ui_kit.Chip` 新增 `kind="error"`（红芯片），配色取主题令牌 `error_bg / error_fg / error_line`；
+- 守卫的判据函数（`format_guard()` / `build_session_format()` / `scan_session_formats()` /
+  `can_migrate_edges()` / `_format_tree_for()`）放在核心 `dsh_lanes.py` 里，与网页版 web-0.7 共用同一套，
+  两边只各自本地化文案。
+
+---
+
 ## v0.3.11 — 2026-10-27
 
 ### `taskkill` 说"没有找到进程"，可它明明还活着

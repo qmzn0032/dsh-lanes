@@ -86,7 +86,7 @@ apply_theme(_saved_theme())
 # ── 版本号：窗口标题和状态条都会打出它 ──────────────────────────────────────
 # 加这个的原因很实在：你会怀疑"我开的和你的不是同一版"，而界面上原来没有任何
 # 版本标识 —— 只能靠背景色猜。以后打开先看右下角/标题栏这几个字，一眼对上。
-APP_VERSION = "v0.3.11"
+APP_VERSION = "v0.3.12"
 
 FONT_UI = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
@@ -259,6 +259,44 @@ def short_url(url: str, keep: int = 14) -> str:
     return f"{head}{tok[:keep]}…{tok[-4:]}"
 
 
+# ── 会话格式守卫：core.format_guard() 的返回值 → 卡片上怎么显示 ─────────────
+# 判据全在核心（读安装树里的 SESSION_FORMAT_VERSION / 升级包，再数 HOME 里的会话文件），
+# 这里只负责"说人话"：卡片上一枚小芯片 + 一句警告；点「打开」时才弹确认框。
+def fmt_badge(guard: dict | None) -> tuple[str, str] | None:
+    """卡片标题旁的小芯片：(文案, Chip 的 kind)。没问题 / 判断不出来就 None，不占地方。"""
+    if not guard:
+        return None
+    level = guard.get("level")
+    bv = guard.get("build")
+    if level == "warn":
+        older = guard.get("older") or []
+        return (f"会话 v{older[-1]}→v{bv}" if older and bv is not None else "会话格式", "warn")
+    if level == "danger":
+        if guard.get("newer"):
+            return (f"! 会话 v{guard.get('home_max')} 太新", "error")
+        missing = guard.get("missing") or []
+        if missing:
+            return (f"! 缺升级包 v{missing[0]}", "error")
+        return ("! 会话格式", "error")
+    return None
+
+
+def fmt_note(guard: dict | None) -> tuple[str, str] | None:
+    """卡片上那一行警告：(文案, 颜色)。只有 warn / danger 才返回。"""
+    if not guard:
+        return None
+    level = guard.get("level")
+    if level == "danger":
+        return (str(guard.get("headline") or "会话格式对不上，打开可能报错"), RED)
+    if level == "warn":
+        older = guard.get("older") or []
+        bv = guard.get("build")
+        n = sum(int((guard.get("counts") or {}).get(str(g), 0)) for g in older)
+        return (f"{n} 个旧会话（v{older[0]} 起）打开时会被就地升到 v{bv}，"
+                f"之后 v{bv} 以前的版本读不了它们", AMBER)
+    return None
+
+
 def _set_wrap(label: tk.Label, width: int, min_w: int) -> None:
     """把标签的 wraplength 跟着容器宽度调。
 
@@ -292,6 +330,7 @@ class LaneCard(ui.RoundedCard):
         is_primary: bool = False,
         primary_name: str | None = None,
         primary_refs: dict | None = None,
+        guard: dict | None = None,
     ) -> None:
         super().__init__(
             master,
@@ -310,6 +349,7 @@ class LaneCard(ui.RoundedCard):
         self.data = data
         self.runtime = runtime
         self.is_primary = is_primary
+        self.guard = guard
 
         pad = tk.Frame(self.inner, bg=CARD)
         pad.pack(fill="x")
@@ -344,6 +384,9 @@ class LaneCard(ui.RoundedCard):
         title.pack(anchor="w")
         tk.Label(title, text=name, bg=CARD, fg=TEXT, font=(FONT_UI, 13, "bold")).pack(side="left")
         ui.Chip(title, str(data.get("version", "?")), "ver", bg=CARD).pack(side="left", padx=(7, 0))
+        fmt_chip = fmt_badge(guard)
+        if fmt_chip:
+            ui.Chip(title, fmt_chip[0], fmt_chip[1], bg=CARD).pack(side="left", padx=(6, 0))
         if is_primary:
             ui.Chip(title, "★ 主要版本", "primary", bg=CARD).pack(side="left", padx=(6, 0))
 
@@ -351,6 +394,19 @@ class LaneCard(ui.RoundedCard):
         if runtime:
             meta += f"   PID {runtime.get('pid')}"
         tk.Label(left, text=meta, bg=CARD, fg=MUTED, font=(FONT_UI, 9)).pack(anchor="w", pady=(3, 0))
+
+        fmt_line = fmt_note(guard)
+        if fmt_line:
+            tk.Label(
+                left,
+                text=fmt_line[0],
+                bg=CARD,
+                fg=fmt_line[1],
+                font=(FONT_UI, 8),
+                anchor="w",
+                justify="left",
+                wraplength=340,
+            ).pack(anchor="w", pady=(3, 0))
 
         url = (runtime or {}).get("url") or ""
         if url:
@@ -1441,6 +1497,20 @@ class LauncherApp:
         except Exception:
             installs = []
 
+        # 每条 lane 的「会话格式体检」：只看安装树与 HOME 里的会话文件名，不动任何文件。
+        # 核心那边有 60 秒缓存（安装树 / sessions 目录各一份），所以每轮刷新都算也不贵。
+        guards: dict[str, dict] = {}
+        for name, data in (cfg.get("lanes") or {}).items():
+            if not isinstance(data, dict):
+                continue
+            try:
+                guards[name] = core.format_guard(cfg, name)
+            except Exception as exc:  # noqa: BLE001 —— 体检坏了不能拖垮整个列表
+                guards[name] = {
+                    "lane": name, "level": "unknown",
+                    "headline": f"体检失败：{type(exc).__name__}: {exc}",
+                }
+
         signature = (
             str(cfg.get("primary") or ""),
             tuple(
@@ -1454,6 +1524,10 @@ class LauncherApp:
                 for name, data in cfg.get("lanes", {}).items()
                 if isinstance(data, dict)
             ),
+            tuple(
+                (name, g.get("level"), g.get("ack"), g.get("acked"))
+                for name, g in guards.items()
+            ),
             tuple((i["port"], i["pid"]) for i in foreign),
         )
         self._snap = {
@@ -1461,6 +1535,7 @@ class LauncherApp:
             "states": states,
             "foreign": foreign,
             "installs": installs,
+            "guards": guards,
             "signature": signature,
             "version_fixes": version_fixes,
         }
@@ -1540,6 +1615,7 @@ class LauncherApp:
                         is_primary=(name == top),
                         primary_name=top,
                         primary_refs=top_refs,
+                        guard=snap.get("guards", {}).get(name),
                     )
                 except Exception as exc:  # noqa: BLE001
                     self.log(f"[XX] lane「{name}」的卡片画不出来："
@@ -1834,6 +1910,12 @@ class LauncherApp:
 
     # ── 操作 ────────────────────────────────────────────────────────────────
     def open_lane(self, lane: str, port: int | None = None) -> None:
+        """「打开」（含双击卡片）：先过一遍会话格式体检，确认了才真开。"""
+        if not self.fmt_gate(lane, port):
+            return
+        self._open_now(lane, port)
+
+    def _open_now(self, lane: str, port: int | None = None) -> None:
         args = argparse.Namespace(
             target=lane, port=port, cwd=None, timeout=None, no_browser=False, detach=True
         )
@@ -1842,6 +1924,122 @@ class LauncherApp:
             core.cmd_open(core.load_config(), args)
 
         self.run_job(f"打开 {lane}", job)
+
+    # ── 会话格式守卫（v0.3.12）──────────────────────────────────────────────
+    def fmt_gate(self, lane: str, port: int | None = None) -> bool:
+        """打开前的会话格式体检。返回 False＝这次不开；True＝接着开。
+
+        False 有两种来路：用户点了「取消」，或者"先备份再开"已经排进任务队列
+        （备份完由 on_done 接着打开，所以这里不能再开第二次）。
+        warn（只有旧会话、能被就地升级）记住过一次就放行；
+        danger（HOME 里有比本版新的会话 / 缺升级包）每次都拦。
+        """
+        try:
+            guard = core.format_guard(core.load_config(), lane)
+        except Exception as exc:  # noqa: BLE001 —— 体检坏了不能连"打开"都做不了
+            self.log(f"[!!] 会话格式体检失败（{type(exc).__name__}: {exc}），照常打开", "warn")
+            return True
+        level = guard.get("level")
+        if level not in ("warn", "danger"):
+            return True
+        if level == "warn" and guard.get("acked"):
+            return True
+        ans = self.fmt_dialog(guard)
+        if not ans:
+            self.log(f"已取消打开「{lane}」：{guard.get('headline')}", "muted")
+            return False
+        if ans.get("ack"):
+            cfg = core.load_config()
+            cfg.setdefault("fmtAck", {})[lane] = guard.get("ack") or ""
+            core.save_config(cfg)
+            self._invalidate()
+            self.log(f"已记住：lane「{lane}」的会话格式（{guard.get('ack')}）不再提醒；"
+                     f"格式再变（换版本 / HOME 里出现新一代）会重新问", "ok")
+        if ans.get("backup"):
+            def back() -> None:
+                core.cmd_chat_backup(core.load_config(),
+                                     argparse.Namespace(lane=lane, name="before-open"))
+
+            self.run_job(f"备份对话：{lane}（打开前）", back,
+                         on_done=lambda: self._open_now(lane, port))
+            return False
+        return True
+
+    def fmt_dialog(self, guard: dict) -> dict | None:
+        """会话格式确认框：返回 {backup, ack} 或 None（取消）。
+
+        用 Toplevel 而不是 messagebox —— 这里要带两个勾选框（先备份 / 以后别再问），
+        messagebox 塞不下。
+        """
+        lane = guard.get("lane") or "?"
+        danger = guard.get("level") == "danger"
+        bv = guard.get("build")
+        dlg = tk.Toplevel(self.root)
+        dlg.title("打开前先确认：会话格式")
+        dlg.configure(bg=BG)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        body = tk.Frame(dlg, bg=BG)
+        body.pack(fill="both", expand=True, padx=18, pady=(14, 4))
+
+        tk.Label(body, text=f"打开 lane「{lane}」前先确认", bg=BG, fg=TEXT,
+                 font=(FONT_UI, 13, "bold")).pack(anchor="w")
+        tk.Label(body, text=str(guard.get("headline") or ""), bg=BG,
+                 fg=(RED if danger else AMBER), font=(FONT_UI, 11, "bold"),
+                 justify="left", anchor="w", wraplength=660).pack(anchor="w", pady=(7, 5))
+        tk.Label(body, text="\n".join(guard.get("detail") or []), bg=BG, fg=MUTED,
+                 font=(FONT_UI, 9), justify="left", anchor="w",
+                 wraplength=660).pack(anchor="w")
+
+        backup_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            body,
+            text=f"先备份对话再打开（推荐；快照存 {core.paths(core.load_config())['backups']}"
+                 f"\\chat\\{lane}，可随时恢复）",
+            variable=backup_var, bg=BG, activebackground=BG, selectcolor=_T.overlay,
+            highlightthickness=0, bd=0, fg=TEXT, activeforeground=TEXT,
+            font=(FONT_UI, 9), anchor="w", justify="left", wraplength=660,
+        ).pack(anchor="w", pady=(10, 0))
+
+        ack_var = tk.BooleanVar(value=False)
+        if not danger:
+            tk.Checkbutton(
+                body,
+                text=f"以后别再问（记住「v{bv} × HOME 最高 v{guard.get('home_max')}」；"
+                     f"格式再变会重新问）",
+                variable=ack_var, bg=BG, activebackground=BG, selectcolor=_T.overlay,
+                highlightthickness=0, bd=0, fg=MUTED, activeforeground=MUTED,
+                font=(FONT_UI, 9), anchor="w", justify="left", wraplength=660,
+            ).pack(anchor="w", pady=(3, 0))
+
+        result: dict | None = None
+
+        def done(go: bool) -> None:
+            nonlocal result
+            if go:
+                result = {"backup": bool(backup_var.get()), "ack": bool(ack_var.get())}
+            try:
+                dlg.destroy()
+            except tk.TclError:
+                pass
+
+        foot = tk.Frame(dlg, bg=BG)
+        foot.pack(fill="x", padx=18, pady=(10, 14))
+        self.button(foot, "取消", lambda: done(False), size="sm").pack(side="right", padx=(8, 0))
+        self.button(foot, "仍然打开" if danger else "打开", lambda: done(True),
+                    primary=True, size="sm").pack(side="right")
+
+        dlg.protocol("WM_DELETE_WINDOW", lambda: done(False))
+        dlg.update_idletasks()
+        w = 700
+        h = int(dlg.winfo_reqheight())
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + max(40, (self.root.winfo_height() - h) // 2)
+        dlg.geometry(f"{w}x{h}+{max(0, x)}+{max(0, y)}")
+        self.root.wait_window(dlg)
+        return result
 
     def stop_lane(self, lane: str) -> None:
         args = argparse.Namespace(target=[lane])

@@ -6192,6 +6192,268 @@ def cmd_market_update(cfg: dict, args) -> int:
     return 1 if problems else 0
 
 
+# ======================= 会话格式守卫 =======================
+#
+# DSH 的会话正文按"格式代"落盘，一个会话目录里一代一个文件：
+#     第 0 代    session.jsonl.zstd
+#     第 N 代    session.vN.jsonl.zstd
+# 名字里的 vN 就是**写它那一刻**的会话格式版本。判据全部从安装树里读出来，不是猜的：
+#   @deepseek-ai/dsh-session               `const SESSION_FORMAT_VERSION = 4`
+#   @deepseek-ai/dsh-session-format         sessionFormatLogFilename()：0 代不带 v，之后带 .vN.
+#                                           parseSessionFormatLogFilename()：反解回版本号
+#   @deepseek-ai/dsh-session-format-vN-to-vM 每跨一代一个包 —— 装了几段就能升到第几代
+#   @deepseek-ai/dsh-session-persistence-jsonl  resolveCurrentLog()（本机 0.2.1-rc.4 里读到的原话）：
+#        本版正在用 → 直接读
+#        比本版旧   → 交给升级路径（会写出一份新代文件）
+#        比本版新   → 抛 SessionFormatUnsupportedError：
+#                     "log was written by a newer harness — upgrade the harness to open it"
+#
+# 于是只有两种会出事的情况：
+#   · HOME 里的会话比本版**新** → 那个会话打不开（本版没有往前读的能力）；
+#   · HOME 里的会话比本版**旧** → 能开，但一开就会写出一份新代文件；此后**旧版本**看到
+#     更高代就抛错 —— 这道门只能进不能出。旧文件不删，数据还在，但界面上开不了。
+# 守卫干的事：在"点打开之前"把这两条摆出来，并给一个「先备份对话」的出口。
+# 为什么不做成硬拦截：旧代升级是 DSH 的正常行为，天天用的那条 HOME 里本来就有旧代
+# （本机 global 现在就是 v0×84 / v3×52 / v4×98），每次都拦一下只会让人学会闭眼点确定。
+
+SESSION_LOG_RE = re.compile(r"^session(?:\.v(\d+))?\.jsonl(?:\.zstd)?$")
+_FMT_CACHE_TTL = 60.0
+_FMT_CACHE: dict[str, tuple[float, dict]] = {}
+_SCAN_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+def _session_format_script(tree: Path) -> Path | None:
+    """在安装树里找 `dsh-session/lib/index.js`；两种树形都认（前缀树 / dsh 包目录本身）。"""
+    tree = Path(tree)
+    for sub in (
+        tree / "node_modules" / "@deepseek-ai" / "dsh-session" / "lib" / "index.js",
+        tree / "node_modules" / "@deepseek-ai" / "dsh" / "node_modules"
+        / "@deepseek-ai" / "dsh-session" / "lib" / "index.js",
+    ):
+        if sub.is_file():
+            return sub
+    return None
+
+
+def build_session_format(tree) -> dict:
+    """这棵安装树「读第几代会话格式、带哪几段升级包」。读不到就 version=None。
+
+    结果按安装树路径缓存 60 秒：它只有"换版本/装升级包"才会变，而 /api/state 两秒一读。
+    """
+    if not tree:
+        return {"version": None, "migrations": [], "source": "",
+                "why": "这条 lane 的安装树路径算不出来"}
+    key = str(tree)
+    now = time.time()
+    hit = _FMT_CACHE.get(key)
+    if hit and now - hit[0] < _FMT_CACHE_TTL:
+        return dict(hit[1])
+
+    out = {"version": None, "migrations": [], "source": "", "why": ""}
+    script = _session_format_script(Path(key))
+    if script is None:
+        out["why"] = "安装树里找不到 dsh-session（这棵树可能已经不在了）"
+    else:
+        out["source"] = str(script)
+        try:
+            text = script.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            out["why"] = f"读不动 {script}：{exc}"
+        else:
+            match = re.search(r"SESSION_FORMAT_VERSION\s*=\s*(\d+)", text)
+            if match:
+                out["version"] = int(match.group(1))
+            else:
+                out["why"] = "dsh-session 里没找到 SESSION_FORMAT_VERSION"
+
+    edges: set[tuple[int, int]] = set()
+    for nm in (
+        Path(key) / "node_modules" / "@deepseek-ai",
+        Path(key) / "node_modules" / "@deepseek-ai" / "dsh" / "node_modules" / "@deepseek-ai",
+    ):
+        if not nm.is_dir():
+            continue
+        try:
+            names = os.listdir(nm)
+        except OSError:
+            continue
+        for name in names:
+            m = re.match(r"^dsh-session-format-v(\d+)-to-v(\d+)$", name)
+            if m:
+                edges.add((int(m.group(1)), int(m.group(2))))
+    out["migrations"] = sorted([list(e) for e in edges])
+    _FMT_CACHE[key] = (now, dict(out))
+    return out
+
+
+def can_migrate_edges(build: dict, frm: int, to: int) -> tuple[bool, list[int]]:
+    """从第 frm 代升到第 to 代，缺哪几段升级包（缺了就升不上来，会话打不开）。"""
+    have = {tuple(e) for e in (build.get("migrations") or [])}
+    missing = [g for g in range(frm, to) if (g, g + 1) not in have]
+    return (not missing), missing
+
+
+def scan_session_formats(home) -> dict:
+    """扫这个 HOME 里 sessions 实际写了哪几代会话文件。
+
+    目录形状固定是 `sessions\\<工作区>\\<会话 id>\\文件`（两代代码都没变过），所以只下两级；
+    顺手按 reparse 位剪掉链接目录，别顺着 junction 跑到别人的 HOME 里去数文件。
+    本机 global 有 207 个会话目录：实测整趟 40 ms，还是按 60 秒缓存一下（/api/state 两秒一读）。
+    """
+    key = str(home)
+    now = time.time()
+    hit = _SCAN_CACHE.get(key)
+    if hit and now - hit[0] < _FMT_CACHE_TTL:
+        return dict(hit[1])
+
+    out = {"counts": {}, "sessions": 0, "files": 0}
+    root = Path(home) / "sessions"
+    if not root.is_dir():
+        _SCAN_CACHE[key] = (now, dict(out))
+        return out
+    try:
+        workspaces = list(root.iterdir())
+    except OSError:
+        return out
+    for ws in workspaces:
+        if not ws.is_dir() or _is_reparse(ws):
+            continue
+        try:
+            sessions = list(ws.iterdir())
+        except OSError:
+            continue
+        for sess in sessions:
+            if not sess.is_dir() or _is_reparse(sess):
+                continue
+            hit = False
+            try:
+                files = list(sess.iterdir())
+            except OSError:
+                continue
+            for f in files:
+                if not f.is_file():
+                    continue
+                m = SESSION_LOG_RE.match(f.name)
+                if not m:
+                    continue
+                gen = int(m.group(1)) if m.group(1) else 0
+                out["counts"][str(gen)] = out["counts"].get(str(gen), 0) + 1
+                out["files"] += 1
+                hit = True
+            if hit:
+                out["sessions"] += 1
+    _SCAN_CACHE[key] = (now, dict(out))
+    return out
+
+
+def _format_tree_for(cfg: dict, lane: str, version: str) -> tuple[Path | None, bool]:
+    """换成 `version` 之后会用哪棵安装树；第二个值＝这棵树里真的是那个版本吗。
+
+    会话格式版本是**包**的属性，不是树的位置的属性 —— 所以接管/副本 lane 预演别的版本时，
+    只要本机 `versions\\<那个版本>` 里装的是同一个包，读它得到的代数就是准的（当代理用）。
+    """
+    data = (cfg.get("lanes") or {}).get(lane) or {}
+    if data.get("installDir"):
+        # 接管/副本：树的位置写死，换版本是换树里的包。目标版本还没装进去时，
+        # 现在读到的仍然是**当前**那版，不能拿它冒充目标版本。
+        tree = Path(data["installDir"])
+        here = package_version_at(tree) or installed_version(tree)
+        if str(here or "") == str(version or ""):
+            return tree, True
+        proxy = paths(cfg)["versions"] / str(version or "")
+        if proxy.is_dir() and installed_version(proxy) == str(version or ""):
+            return proxy, True
+        return tree, False
+    vdir = paths(cfg)["versions"] / str(version or "")
+    if not vdir.is_dir():
+        return vdir, False
+    return vdir, installed_version(vdir) == str(version or "")
+
+
+def format_guard(cfg: dict, lane: str, target: str = "") -> dict:
+    """一条 lane 的「会话格式体检」：本版读哪代、HOME 里实际有哪几代、开它会不会出事。
+
+    `target` 给了版本号就按**那个版本**算（升级/降级预演）；只算路径、不联网、不装东西。
+    """
+    data = (cfg.get("lanes") or {}).get(lane) or {}
+    cur = str(data.get("version") or "")
+    want = str(target or "").strip()
+    home = Path(data.get("home") or (paths(cfg)["homes"] / lane))
+
+    tree, exact = _format_tree_for(cfg, lane, want or cur)
+    build = build_session_format(tree if exact else None)
+    if not exact:
+        build = {"version": None, "migrations": [], "source": "",
+                 "why": f"本机还没有「{want or cur}」的安装树 —— 装完才知道它读第几代"}
+    scan = scan_session_formats(home)
+
+    counts = {int(k): v for k, v in (scan.get("counts") or {}).items()}
+    gens = sorted(counts)
+    bv = build.get("version")
+    home_max = gens[-1] if gens else None
+    newer = [g for g in gens if bv is not None and g > bv]
+    older = [g for g in gens if bv is not None and g < bv]
+    missing: list[int] = []
+    if bv is not None:
+        for g in older:
+            _ok, miss = can_migrate_edges(build, g, bv)
+            missing += [x for x in miss if x not in missing]
+    ack = f"{bv}:{home_max if home_max is not None else '-'}"
+    acked = str((cfg.get("fmtAck") or {}).get(lane) or "") == ack
+
+    label = f"目标版本 {want}" if want and want != cur else f"当前版本 {cur or '?'}"
+    fmt_line = " / ".join(f"v{g}×{counts[g]}" for g in gens) or "（没有会话文件）"
+    if bv is None:
+        level = "unknown"
+        headline = "读不到安装树里的会话格式版本，判断不了"
+    elif not scan["files"]:
+        level = "empty"
+        headline = "这个 HOME 里还没有会话文件，换版本随便换"
+    elif newer:
+        level = "danger"
+        n = sum(counts[g] for g in newer)
+        headline = f"{n} 个会话比本版新（v{home_max} > v{bv}），本版打不开这些会话"
+    elif missing:
+        level = "danger"
+        headline = (f"这份安装缺升级包 v{missing[0]}→v{missing[0] + 1}："
+                    f"旧会话（{fmt_line}）升不到 v{bv}，打开会报错")
+    elif older:
+        level = "warn"
+        n = sum(counts[g] for g in older)
+        headline = (f"{n} 个旧会话（{fmt_line}）打开时会被就地升级到 v{bv}；"
+                    f"升上去以后 v{bv} 以前的版本就读不了它们了")
+    else:
+        level = "ok"
+        headline = f"全部会话都是 v{bv}，和本版一致"
+
+    detail = [
+        (f"{label}：读 v{bv}" if bv is not None
+         else f"{label}：读哪一代读不出来（{build.get('why') or '原因不明'}）"),
+        f"HOME 里：{scan['sessions']} 个会话，文件 {fmt_line}",
+        ("升级包：" + ("、".join(f"v{a}→v{b}" for a, b in build.get("migrations") or [])
+                       or "一段都没有")) if bv is not None else "升级包：读不到（没有安装树）",
+    ]
+    if newer:
+        detail.append(f"比本版新的 {sum(counts[g] for g in newer)} 个：本版没有往前读的能力，"
+                      f"打开会抛 “written by a newer harness”。要读它们，得换到能读 v{home_max} 的版本。")
+    if older:
+        detail.append(f"比本版旧的 {sum(counts[g] for g in older)} 个：能开，但一开就会写一份 "
+                      f"v{bv} 新文件；之后旧版本看到更高代直接报错。原始文件不会被删。")
+    if level in ("warn", "danger"):
+        detail.append("开门之前可以「先备份对话」（快照存 <root>\\backups\\chat\\<lane>，可随时恢复）。")
+
+    return {
+        "lane": lane, "version": cur, "target": want, "tree": str(tree) if tree else "",
+        "build": bv, "source": build.get("source") or "", "why": build.get("why") or "",
+        "migrations": build.get("migrations") or [],
+        "home": str(home), "counts": {str(k): counts[k] for k in gens},
+        "sessions": scan["sessions"], "files": scan["files"],
+        "home_max": home_max, "newer": newer, "older": older, "missing": missing,
+        "level": level, "headline": headline, "detail": detail,
+        "ack": ack, "acked": acked,
+    }
+
+
 # ======================= 备份对话（sessions 快照） =======================
 
 
